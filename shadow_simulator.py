@@ -21,15 +21,17 @@ class ShadowSimulator:
     """
     Simulates spot execution against live Wallex order-book depth:
     - Market orders cross at top-of-book (best_ask for BUY, best_bid for SELL).
-    - Limit orders rest and fill if market touches or crosses the price.
-    - Charges 0.2% trading fee on every transaction.
+    - Limit orders rest and fill if market touches or crosses the price (Maker fee: 0.25%).
+    - Market orders and immediate marketable limit orders incur Taker fee (0.30%).
     - Tracks stale simulated orders and releases locked capital.
     """
 
     def __init__(self, config: AgentConfig, state_mgr: PortfolioStateManager):
         self.config = config
         self.state_mgr = state_mgr
-        self.fee_rate = config.fee_rate  # Default 0.002 (0.2%)
+        self.maker_fee = getattr(config, "maker_fee_rate", 0.0025)
+        self.taker_fee = getattr(config, "taker_fee_rate", 0.0030)
+        self.fee_rate = self.taker_fee
 
     def execute_order(
         self,
@@ -58,7 +60,7 @@ class ShadowSimulator:
         if order_type.upper() == "MARKET":
             fill_price = best_ask if side.upper() == "BUY" else best_bid
             notional = quantity * fill_price
-            fee_tmn = notional * self.fee_rate
+            fee_tmn = notional * self.taker_fee
 
             return {
                 "status": "FILLED",
@@ -77,11 +79,11 @@ class ShadowSimulator:
             if price is None:
                 return {"status": "REJECTED", "reason": "Missing price for LIMIT order"}
 
-            # Check if limit order crosses spread immediately (marketable limit)
+            # Check if limit order crosses spread immediately (marketable limit -> Taker fee)
             if side.upper() == "BUY" and price >= best_ask:
                 # Fills immediately at best_ask
                 notional = quantity * best_ask
-                fee_tmn = notional * self.fee_rate
+                fee_tmn = notional * self.taker_fee
                 return {
                     "status": "FILLED",
                     "client_id": client_id,
@@ -97,7 +99,7 @@ class ShadowSimulator:
             elif side.upper() == "SELL" and price <= best_bid:
                 # Fills immediately at best_bid
                 notional = quantity * best_bid
-                fee_tmn = notional * self.fee_rate
+                fee_tmn = notional * self.taker_fee
                 return {
                     "status": "FILLED",
                     "client_id": client_id,
@@ -164,7 +166,8 @@ class ShadowSimulator:
 
             if filled:
                 notional = order.quantity * fill_price
-                fee_tmn = notional * self.fee_rate
+                # Resting limit orders fill as Maker (0.25%)
+                fee_tmn = notional * self.maker_fee
                 self.state_mgr.remove_open_order(order.client_id)
                 res = {
                     "status": "FILLED",

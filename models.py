@@ -3,7 +3,8 @@
 Data models and schemas for trading decisions, portfolio state, and order tracking.
 """
 
-from typing import List, Optional, Literal, Dict
+from datetime import datetime, timezone
+from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -56,14 +57,17 @@ class PortfolioState(BaseModel):
     Persistent snapshot of portfolio equity, cash reserves, and positions.
     Preserved across script restarts in portfolio_state.json.
     """
-    available_tmn: float
+    available_tmn: float = 5000000.0
+    shadow_available_tmn: Optional[float] = None
     locked_tmn: float = 0.0
-    total_equity_tmn: float
-    peak_equity_tmn: float
+    total_equity_tmn: float = 5000000.0
+    peak_equity_tmn: float = 5000000.0
     realized_pnl_tmn: float = 0.0
     total_trades_count: int = 0
     winning_trades_count: int = 0
     losing_trades_count: int = 0
     positions: Dict[str, PositionState] = Field(default_factory=dict)
     open_orders: List[OpenOrderRecord] = Field(default_factory=list)
-    last_updated: str
+    pending_buy_orders: Dict[str, Any] = Field(default_factory=dict)
+    last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: Optional[str] = None

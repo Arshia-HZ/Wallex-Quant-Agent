@@ -52,7 +52,7 @@ class QuantFeatureEngine:
             rsi_val = 100.0 - (100.0 / (1.0 + rs.iloc[-1]))
             rsi = 50.0 if np.isnan(rsi_val) else float(rsi_val)
 
-            # 3. ATR(14) & ATR % of Price (Crucial to verify volatility beats 0.4% round-trip fee)
+            # 3. ATR(14) & ATR % of Price (Crucial to verify volatility beats 0.55%-0.60% round-trip fee)
             tr = pd.concat([
                 high - low,
                 (high - close.shift()).abs(),

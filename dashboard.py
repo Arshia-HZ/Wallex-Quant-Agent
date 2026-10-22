@@ -282,7 +282,7 @@ with tab2:
 # ---- TAB 3: BACKTEST & SHADOW TEST RUNNER (20 PTS) ----
 with tab3:
     st.subheader("⏪ Event-Driven Historical Backtester (Live Wallex Candles)")
-    st.caption("Demonstrates strategy repeatability on historical Wallex OHLCV data with 0.2% per-side fee modeling.")
+    st.caption("Demonstrates strategy repeatability on historical Wallex OHLCV data with Wallex Credit Account fee modeling (0.25% Maker / 0.30% Taker).")
 
     b_col1, b_col2, b_col3 = st.columns([2, 2, 1])
     bt_symbol = b_col1.selectbox("Select Approved TMN Market", PRIORITY_ALLOWED_TMN_MARKETS, index=0)

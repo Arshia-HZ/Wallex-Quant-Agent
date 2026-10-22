@@ -408,7 +408,8 @@ class PortfolioAndRiskManager:
 
         if pnl_pct >= self.config.trailing_activation_pct:
             pos.trailing_active = True
-            breakeven_plus = pos.entry_price * (1.0 + 2.5 * self.config.fee_rate_per_side)
+            # Breakeven locks at least (Maker Buy + Taker Sell + 0.15% net profit margin) above entry price
+            breakeven_plus = pos.entry_price * (1.0 + self.config.maker_fee_rate + self.config.taker_fee_rate + 0.0015)
             trail_stop = pos.highest_price * (1.0 - self.config.trailing_distance_pct)
             new_sl = max(pos.stop_loss_price, breakeven_plus, trail_stop)
             if new_sl > pos.stop_loss_price:
@@ -748,15 +749,21 @@ class TradingAgentRunner:
             # Place limit buy at best_bid (or AI limit price capped at best_ask)
             exec_price = min(decision.limit_price or feats["best_bid"], feats["best_ask"])
 
-        raw_qty = (order_tmn * (1.0 - self.config.fee_rate_per_side)) / exec_price
+        # Wallex Credit Account: Maker (0.25%) for LIMIT buy, Taker (0.30%) for MARKET buy
+        buy_fee_rate = self.config.taker_fee_rate if decision.order_type == "MARKET" else self.config.maker_fee_rate
+        raw_qty = (order_tmn * (1.0 - buy_fee_rate)) / exec_price
 
-        atr_sl = exec_price - (1.5 * feats["atr_14"])
+        # FIX: Scale 15-min ATR to hourly equivalent for realistic SL placement
+        hourly_atr = feats["atr_14"] * 2.0
+        atr_sl = exec_price - (2.0 * hourly_atr)
         hard_sl = exec_price * (1.0 - self.config.hard_stop_loss_pct)
-        sl_price = max(atr_sl, hard_sl)
+        sl_price = min(atr_sl, hard_sl)  # min() picks the WIDER (safer) stop
         if decision.stop_loss_price and hard_sl <= decision.stop_loss_price < exec_price:
             sl_price = decision.stop_loss_price
 
-        atr_tp = exec_price + (2.4 * feats["atr_14"])
+        # Dynamic TP: max of fixed TP% or 3x SL distance (reward:risk >= 3:1)
+        sl_distance = exec_price - sl_price
+        atr_tp = exec_price + 3.0 * sl_distance
         default_tp = exec_price * (1.0 + self.config.default_take_profit_pct)
         tp_price = max(atr_tp, default_tp)
         if decision.take_profit_price and decision.take_profit_price > exec_price * 1.008:
@@ -876,8 +883,9 @@ class TradingAgentRunner:
 
             gross_cost = pos.quantity * pos.entry_price
             gross_proceeds = sell_qty * exec_price
-            exit_fee = gross_proceeds * self.config.fee_rate_per_side
-            entry_fee = gross_cost * self.config.fee_rate_per_side
+            # Wallex Credit Account fees: Taker (0.30%) on MARKET sell, Maker (0.25%) on LIMIT buy
+            exit_fee = gross_proceeds * self.config.taker_fee_rate
+            entry_fee = gross_cost * self.config.maker_fee_rate
             net_pnl_tmn = (gross_proceeds - exit_fee) - (gross_cost + entry_fee)
             net_pnl_pct = (net_pnl_tmn / max(gross_cost, 1.0)) * 100.0
 

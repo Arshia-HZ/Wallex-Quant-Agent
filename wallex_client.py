@@ -141,13 +141,14 @@ class WallexClient:
     ) -> pd.DataFrame:
         """
         Fetches historical OHLCV candle data via /v1/udf/history.
+        Automatically resamples 1m data to true 15m or 60m candles if Wallex returns 1m resolution.
         """
         norm = normalize_symbol(symbol)
         now = int(time.time())
         frm = now - (lookback_hours * 3600)
         params = {"symbol": norm, "resolution": resolution, "from": frm, "to": now}
         try:
-            resp = self.session.get(f"{self.config.base_url}/v1/udf/history", params=params, timeout=12)
+            resp = self.session.get(f"{self.config.base_url}/v1/udf/history", params=params, timeout=25)
             resp.raise_for_status()
             data = resp.json()
             if data.get("s") != "ok" or not data.get("t"):
@@ -161,6 +162,21 @@ class WallexClient:
                 "close": [float(x) for x in data["c"]],
                 "volume": [float(x) for x in data["v"]],
             })
+
+            # Wallex UDF API returns 1-minute candles even when resolution="15" is requested.
+            # Resample into proper 15-minute or 60-minute candles for accurate multi-candle quant indicators.
+            if len(df) > 2 and (df["timestamp"].iloc[1] - df["timestamp"].iloc[0]) <= 120 and resolution in ("15", "60"):
+                freq = "15min" if resolution == "15" else "60min"
+                df["dt"] = pd.to_datetime(df["timestamp"], unit="s")
+                df = df.set_index("dt").resample(freq).agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                    "timestamp": "first",
+                }).dropna().reset_index(drop=True)
+
             return df
         except Exception as e:
             logger.error(f"Error fetching candles for {norm}: {e}")

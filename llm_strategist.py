@@ -35,13 +35,13 @@ You must output ONLY valid JSON matching this schema:
 }
 
 DECISION LOGIC & CONTEST RULES:
-1. FEE & VOLATILITY GUARD: Wallex charges 0.2% per side (0.4% round-trip). Never BUY if spread_pct > 0.22% or atr_pct < 0.30% (insufficient volatility to cover fees).
+1. FEE & VOLATILITY GUARD: Wallex Credit Account charges 0.25% Maker and 0.30% Taker (~0.55%-0.60% round-trip). Never BUY if spread_pct > 0.20% or atr_pct < 0.40% (insufficient volatility to cover fees).
 2. BUY requires confluence of at least 2 independent signals:
    - Setup A (Trend Pullback): trend_bullish is true (EMA9 > EMA21), RSI_14 between 36 and 63, and (obi_top5 >= +0.10 or taker_buy_ratio >= 0.55).
    - Setup B (Mean-Reversion Bounce): RSI_14 < 34 or bb_position < 0.15, combined with strong buyer absorption (obi_top5 >= +0.18 or taker_buy_ratio >= 0.56).
    - Setup C (Momentum Breakout): volume_zscore >= 1.5, roc_3_pct > 0.35%, obi_top5 >= +0.15, and RSI_14 < 67.
-3. Order Pricing: Prefer LIMIT order at best_bid (for BUY) to minimize slippage, or MARKET if volume_zscore > 2.0 and obi_top5 > 0.30.
-4. Risk Bounds: Set stop_loss_price = max(last_price - 1.5 * atr_14, last_price * 0.988). Set take_profit_price = max(last_price + 2.4 * atr_14, last_price * 1.016).
+3. Order Pricing: Prefer LIMIT order at best_bid (for BUY) to capture Maker fee (0.25%), or MARKET only if volume_zscore > 2.0 and obi_top5 > 0.30.
+4. Risk Bounds: Set stop_loss_price = min(last_price - 4.0 * atr_14, last_price * 0.988) — use min() to pick the WIDER stop. Set take_profit_price = max(last_price + 3.0 * (last_price - stop_loss_price), last_price * 1.024).
 5. Active Positions: Recommend SELL if trend reverses strongly (EMA9 < EMA21 and obi_top5 < -0.15) or RSI_14 > 73 with weakening taker_buy_ratio < 0.45.
 6. Always write a rich, specific Persian justification in 'reasoning_fa' citing exact indicator values."""
 

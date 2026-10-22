@@ -42,8 +42,15 @@ class AgentConfig:
     min_order_tmn: float = field(
         default_factory=lambda: float(os.getenv("MIN_ORDER_TMN", "150000.0"))
     )
+    # Wallex Credit Account Fee Schedule for TMN base markets: Maker 0.25%, Taker 0.30%
+    maker_fee_rate: float = field(
+        default_factory=lambda: float(os.getenv("MAKER_FEE_RATE", "0.0025"))
+    )
+    taker_fee_rate: float = field(
+        default_factory=lambda: float(os.getenv("TAKER_FEE_RATE", "0.0030"))
+    )
     fee_rate_per_side: float = field(
-        default_factory=lambda: float(os.getenv("FEE_RATE", "0.002"))
+        default_factory=lambda: float(os.getenv("FEE_RATE", "0.0030"))
     )
 
     # Stop-Loss, Take-Profit & Trailing Stop Parameters
@@ -51,13 +58,13 @@ class AgentConfig:
         default_factory=lambda: float(os.getenv("HARD_STOP_LOSS_PCT", "0.012"))
     )
     default_take_profit_pct: float = field(
-        default_factory=lambda: float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "0.020"))
+        default_factory=lambda: float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "0.024"))
     )
     trailing_activation_pct: float = field(
-        default_factory=lambda: float(os.getenv("TRAILING_STOP_ACTIVATION_PCT", "0.009"))
+        default_factory=lambda: float(os.getenv("TRAILING_STOP_ACTIVATION_PCT", "0.015"))
     )
     trailing_distance_pct: float = field(
-        default_factory=lambda: float(os.getenv("TRAILING_STOP_DISTANCE_PCT", "0.005"))
+        default_factory=lambda: float(os.getenv("TRAILING_STOP_DISTANCE_PCT", "0.007"))
     )
     max_portfolio_drawdown_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_PORTFOLIO_DRAWDOWN_PCT", "0.035"))
@@ -68,10 +75,10 @@ class AgentConfig:
         default_factory=lambda: os.getenv("CANDLE_RESOLUTION", "15")
     )
     min_atr_pct: float = field(
-        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.32"))
-    )  # Blocks dead/flat markets that cannot beat 0.4% round-trip fee
+        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.45"))
+    )  # Blocks dead/flat markets that cannot beat 0.55%-0.60% round-trip fee
     max_spread_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.25"))
+        default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.20"))
     )
     loop_interval_sec: int = field(
         default_factory=lambda: int(os.getenv("LOOP_INTERVAL_SECONDS", "40"))
