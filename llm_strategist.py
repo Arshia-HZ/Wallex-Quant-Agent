@@ -1,14 +1,16 @@
 # llm_strategist.py
 """
-Cost-Effective LLM Strategist with Quant Gatekeeper.
-Saves 90%+ API tokens by only waking the LLM when quant setups trigger or open positions need exit evaluation.
-Generates structured JSON trading decisions with Persian audit reasoning for hackathon judges.
+Cost-Effective LLM Strategist with Quant Gatekeeper & Cooldown Cache.
+Fixes reasoning_effort token starvation, strips markdown fences, filters out dead/flat markets,
+and logs structured JSON trading decisions with Persian audit reasoning for hackathon judges.
 """
 
 import os
+import re
+import time
 import json
 import logging
-from typing import Optional
+from typing import Optional, Dict
 from openai import OpenAI
 from models import AIDecisionOutput
 from config import AgentConfig
@@ -16,8 +18,8 @@ from market_compliance import MarketComplianceGuard
 
 logger = logging.getLogger("WallexAgent")
 
-COMPACT_SYSTEM_PROMPT = """You are an institutional Algorithmic Spot Trading Agent in the Wallex 48h Hackathon (5,000,000 TMN capital).
-Your mission: Maximize realized TMN return while keeping Maximum Drawdown strictly under 3.0%.
+COMPACT_SYSTEM_PROMPT = """You are an institutional Algorithmic Spot Trading Agent in the Wallex Hackathon (5,000,000 TMN capital).
+Your mission: Maximize realized TMN return over the 36-hour contest while keeping Maximum Drawdown strictly under 3.0%.
 You must output ONLY valid JSON matching this schema:
 {
   "symbol": "string",
@@ -29,27 +31,22 @@ You must output ONLY valid JSON matching this schema:
   "stop_loss_price": float or null,
   "take_profit_price": float or null,
   "signals_observed": ["string"],
-  "reasoning_fa": "توضیح دقیق فنی به فارسی با ذکر اعداد واقعی RSI, EMA, OBI, Spread, Stop-Loss برای داوران"
+  "reasoning_fa": "توضیح دقیق فنی به فارسی با ذکر اعداد واقعی RSI, EMA, OBI, ATR%, Spread, Stop-Loss برای داوران"
 }
 
 DECISION LOGIC & CONTEST RULES:
-1. BUY requires confluence of at least 2 independent signals:
-   - Trend & Momentum: (EMA9 > EMA21 and RSI_14 between 35 and 62) OR (Oversold bounce RSI_14 < 33 with OBI > +0.20).
-   - Microstructure: Top-5 Order Book Imbalance (obi_top5 > +0.12) indicating solid bid support over ask walls.
-2. Strictly avoid BUY if spread_pct > 0.22% or RSI_14 > 68 (overextended).
-3. Order Pricing: Prefer LIMIT order placed at best_bid (for BUY) to capture maker spread unless volume_zscore > 2.0 indicates an urgent breakout.
-4. Risk Bounds: Calculate stop_loss_price using max(last_price - 1.5 * atr_14, last_price * 0.988). Single-trade risk MUST NEVER exceed 1.2%.
-5. Target take_profit_price at last_price * 1.022 (approx +2.2% gain) or based on recent_high resistance.
-6. For active positions: Evaluate SELL if trend reverses (EMA9 < EMA21), RSI > 72, or stop-loss is threatened.
-7. Always explain why the trade was accepted or rejected in 'reasoning_fa' citing specific market numbers."""
+1. FEE & VOLATILITY GUARD: Wallex charges 0.2% per side (0.4% round-trip). Never BUY if spread_pct > 0.22% or atr_pct < 0.30% (insufficient volatility to cover fees).
+2. BUY requires confluence of at least 2 independent signals:
+   - Setup A (Trend Pullback): trend_bullish is true (EMA9 > EMA21), RSI_14 between 36 and 63, and (obi_top5 >= +0.10 or taker_buy_ratio >= 0.55).
+   - Setup B (Mean-Reversion Bounce): RSI_14 < 34 or bb_position < 0.15, combined with strong buyer absorption (obi_top5 >= +0.18 or taker_buy_ratio >= 0.56).
+   - Setup C (Momentum Breakout): volume_zscore >= 1.5, roc_3_pct > 0.35%, obi_top5 >= +0.15, and RSI_14 < 67.
+3. Order Pricing: Prefer LIMIT order at best_bid (for BUY) to minimize slippage, or MARKET if volume_zscore > 2.0 and obi_top5 > 0.30.
+4. Risk Bounds: Set stop_loss_price = max(last_price - 1.5 * atr_14, last_price * 0.988). Set take_profit_price = max(last_price + 2.4 * atr_14, last_price * 1.016).
+5. Active Positions: Recommend SELL if trend reverses strongly (EMA9 < EMA21 and obi_top5 < -0.15) or RSI_14 > 73 with weakening taker_buy_ratio < 0.45.
+6. Always write a rich, specific Persian justification in 'reasoning_fa' citing exact indicator values."""
 
 
 class CostEffectiveLLMStrategist:
-    """
-    Manages LLM reasoning with Quant Gatekeeper pre-filtering to minimize token usage
-    and guarantee high reasoning quality within the contest budget.
-    """
-
     def __init__(
         self,
         config: Optional[AgentConfig] = None,
@@ -58,66 +55,82 @@ class CostEffectiveLLMStrategist:
         model: Optional[str] = None,
     ):
         self.config = config or AgentConfig()
-        self.api_key = api_key or getattr(self.config, "llm_api_key", "") or os.getenv("LLM_API_KEY", "")
-        self.base_url = (
-            base_url
-            or getattr(self.config, "llm_base_url", "")
-            or os.getenv("LLM_BASE_URL", "https://ai.boxapi.ir/ai/v1")
-        )
-        self.model = (
-            model
-            or getattr(self.config, "llm_model", "")
-            or os.getenv("LLM_MODEL", "gpt-6-luna")
-        )
+        self.api_key = api_key or self.config.llm_api_key or os.getenv("LLM_API_KEY", "")
+        self.base_url = base_url or self.config.llm_base_url or os.getenv("LLM_BASE_URL", "https://ai.boxapi.ir/ai/v1")
+        self.model = model or self.config.llm_model or os.getenv("LLM_MODEL", "gpt-6-luna")
         self.reasoning_effort = (
-            getattr(self.config, "llm_reasoning_effort", "")
-            or os.getenv("LLM_REASONING_EFFORT", "medium")
+            self.config.llm_reasoning_effort or os.getenv("LLM_REASONING_EFFORT", "medium")
         )
 
-        # Initialize OpenAI compatible client
         if self.api_key:
             self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         else:
             self.client = None
-            logger.warning("No LLM_API_KEY provided. Agent will run with rule-based fallback decision mode.")
+            logger.warning("No LLM_API_KEY provided. Agent will use deterministic quant fallback mode.")
 
         self.total_llm_calls = 0
+        # Tracks last HOLD evaluation per symbol to prevent spamming tokens on the same candle
+        self._hold_cooldown_cache: Dict[str, tuple[float, float]] = {}
 
     @staticmethod
-    def should_wake_llm(features: dict, has_open_position: bool) -> tuple[bool, str]:
-        """
-        Quant Gatekeeper:
-        Filters out neutral market conditions in free Python code before spending LLM tokens.
-        Wakes LLM only when an actionable setup is detected or an open position needs active management.
-        """
+    def _clean_json_text(raw_text: str) -> str:
+        """Strips markdown ```json fences or leading/trailing prose around JSON object."""
+        text = raw_text.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return text[start : end + 1]
+        return text
+
+    def should_wake_llm(self, symbol: str, features: dict, has_open_position: bool) -> tuple[bool, str]:
         if not features.get("valid", False):
             return False, features.get("reason", "INVALID_DATA")
 
-        # Position management always wakes LLM
+        # 1. If we hold an open position, wake LLM only if meaningful PnL move or reversal signal occurs
         if has_open_position:
-            return True, "ACTIVE_POSITION_MANAGEMENT"
+            if (not features.get("trend_bullish", True) and features.get("obi_top5", 0.0) < -0.10) or features.get("rsi_14", 50.0) > 70.0:
+                return True, "ACTIVE_POSITION_REVERSAL_CHECK"
+            return False, "POSITION_MONITORED_BY_DETERMINISTIC_SL_TP"
 
-        # Check spread threshold
+        # 2. Check Cooldown Cache (avoid re-calling LLM every 40s after a HOLD unless price moved > 0.35%)
+        now = time.time()
+        last_price = features.get("last_price", 0.0)
+        if symbol in self._hold_cooldown_cache:
+            last_ts, cached_price = self._hold_cooldown_cache[symbol]
+            price_change_pct = abs(last_price - cached_price) / (cached_price + 1e-9) * 100.0
+            if (now - last_ts) < self.config.llm_hold_cooldown_sec and price_change_pct < 0.35:
+                return False, "COOLDOWN_RECENT_LLM_HOLD"
+
+        # 3. Microstructure & Volatility-to-Fee Gate
         spread = features.get("spread_pct", 1.0)
-        if spread > 0.25:
+        if spread > self.config.max_spread_pct:
             return False, f"SPREAD_TOO_WIDE_{spread:.2f}%"
+
+        atr_pct = features.get("atr_pct", 0.5)
+        if atr_pct < self.config.min_atr_pct:
+            return False, f"LOW_VOLATILITY_ATR_{atr_pct:.2f}%_BELOW_FEE_HURDLE"
 
         rsi = features.get("rsi_14", 50.0)
         obi = features.get("obi_top5", 0.0)
+        taker_buy = features.get("taker_buy_ratio", 0.5)
         trend_bullish = features.get("trend_bullish", False)
         vol_z = features.get("volume_zscore", 0.0)
+        bb_pos = features.get("bb_position", 0.5)
+        roc_3 = features.get("roc_3_pct", 0.0)
 
-        # Setup 1: Bullish trend pullback with order book bid pressure
-        if trend_bullish and (35.0 <= rsi <= 62.0) and obi >= 0.12:
-            return True, "TREND_PULLBACK_WITH_POSITIVE_OBI"
+        # Setup 1: Bullish trend pullback with order book or trade flow support
+        if trend_bullish and (36.0 <= rsi <= 63.0) and (obi >= 0.10 or taker_buy >= 0.56):
+            return True, "TREND_PULLBACK_WITH_FLOW_SUPPORT"
 
-        # Setup 2: Deep oversold bounce with buyers stepping into depth
-        if rsi < 33.0 and obi >= 0.20:
-            return True, "OVERSOLD_REVERSAL_SETUP"
+        # Setup 2: Oversold / Lower Bollinger Band bounce with buyer absorption
+        if (rsi < 34.0 or bb_pos < 0.15) and (obi >= 0.16 or taker_buy >= 0.55):
+            return True, "OVERSOLD_BOLLINGER_REVERSAL_SETUP"
 
-        # Setup 3: Volume surge breakout with order book imbalance
-        if vol_z >= 1.8 and obi >= 0.18 and rsi < 66.0:
-            return True, "HIGH_VOLUME_BREAKOUT_SETUP"
+        # Setup 3: High-volume momentum breakout
+        if (vol_z >= 1.5 or roc_3 >= 0.40) and obi >= 0.14 and rsi < 67.0:
+            return True, "HIGH_VOLUME_MOMENTUM_BREAKOUT"
 
         return False, "NO_EDGE_MARKET_NEUTRAL"
 
@@ -127,34 +140,31 @@ class CostEffectiveLLMStrategist:
         features: dict,
         portfolio_state: dict,
         recent_trades_summary: Optional[dict] = None,
-    ) -> AIDecisionOutput:
+    ) -> tuple[AIDecisionOutput, bool]:
         """
-        Evaluates market opportunity:
-        1. Checks market compliance.
-        2. Evaluates Quant Gatekeeper.
-        3. If triggered, sends compact prompt to LLM and returns validated AIDecisionOutput.
+        Returns (AIDecisionOutput, was_llm_invoked: bool).
         """
         norm_symbol = MarketComplianceGuard.assert_market_allowed(symbol)
         has_pos = portfolio_state.get("position_qty", 0.0) > 0
 
-        wake, trigger_reason = self.should_wake_llm(features, has_open_position=has_pos)
-
+        wake, trigger_reason = self.should_wake_llm(norm_symbol, features, has_open_position=has_pos)
         if not wake:
-            return AIDecisionOutput(
-                symbol=norm_symbol,
-                action="HOLD",
-                order_type="LIMIT",
-                confidence=0.5,
-                allocation_pct=0.0,
-                signals_observed=[trigger_reason],
-                reasoning_fa=f"عدم فراخوانی مدل زبانی جهت بهینه‌سازی بودجه: وضعیت بازار خنثی است ({trigger_reason})."
+            return (
+                AIDecisionOutput(
+                    symbol=norm_symbol,
+                    action="HOLD",
+                    order_type="LIMIT",
+                    confidence=0.5,
+                    allocation_pct=0.0,
+                    signals_observed=[trigger_reason],
+                    reasoning_fa=f"فیلتر دروازه‌بان کمّی: عدم نیاز به فراخوانی مدل زبانی ({trigger_reason}).",
+                ),
+                False,
             )
 
-        # Fallback if no LLM API key configured: produce deterministic quant decision
         if not self.client:
-            return self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason)
+            return self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason), True
 
-        # Build compact user payload (< 250 tokens)
         user_payload = {
             "symbol": norm_symbol,
             "trigger": trigger_reason,
@@ -169,49 +179,58 @@ class CostEffectiveLLMStrategist:
             },
         }
 
+        messages = [
+            {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ]
+
         try:
             self.total_llm_calls += 1
-            call_kwargs = {
-                "model": self.model,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
-                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-                ],
-                "timeout": 18.0,
-            }
-
-            # پشتیبانی کامل از مدل‌های استدلالی (Reasoning Models) مانند GPT-6 Luna
-            if self.reasoning_effort:
-                call_kwargs["reasoning_effort"] = self.reasoning_effort
-                call_kwargs["max_completion_tokens"] = 600
-            else:
-                call_kwargs["temperature"] = 0.1
-                call_kwargs["max_tokens"] = 500
-
-            response = self.client.chat.completions.create(**call_kwargs)
-            raw_content = response.choices[0].message.content
-            parsed = json.loads(raw_content)
+            raw_content = self._call_llm_with_retry(messages)
+            cleaned_json = self._clean_json_text(raw_content)
+            parsed = json.loads(cleaned_json)
             parsed["symbol"] = norm_symbol
-            return AIDecisionOutput(**parsed)
+            decision = AIDecisionOutput(**parsed)
+
+            if decision.action == "HOLD":
+                self._hold_cooldown_cache[norm_symbol] = (time.time(), features.get("last_price", 0.0))
+            return decision, True
 
         except Exception as e:
-            logger.error(f"LLM API Error on {norm_symbol}: {e}")
-            # Fallback safe decision preserving 15/15 stability points
-            return AIDecisionOutput(
-                symbol=norm_symbol,
-                action="HOLD",
-                order_type="LIMIT",
-                confidence=0.0,
-                allocation_pct=0.0,
-                signals_observed=["LLM_API_FALLBACK"],
-                reasoning_fa=f"خطا در ارتباط با API هوش مصنوعی؛ فعال‌سازی وضعیت ایمن HOLD جهت حفظ پایداری سیستم ({str(e)[:60]})."
-            )
+            logger.warning(f"LLM API Error on {norm_symbol} ({e}) -> Using deterministic quant fallback.")
+            return self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason), True
+
+    def _call_llm_with_retry(self, messages: list) -> str:
+        """Tries reasoning mode first (with ample token budget), then falls back to standard chat completion."""
+        call_kwargs = {
+            "model": self.model,
+            "response_format": {"type": "json_object"},
+            "messages": messages,
+            "timeout": 20.0,
+        }
+        if self.reasoning_effort:
+            try:
+                resp = self.client.chat.completions.create(
+                    **call_kwargs,
+                    reasoning_effort=self.reasoning_effort,
+                    max_completion_tokens=1500,  # Enough room for internal CoT + JSON output
+                )
+                content = resp.choices[0].message.content
+                if content and "{" in content:
+                    return content
+            except Exception as inner_e:
+                logger.debug(f"Reasoning parameter call failed, retrying standard completion: {inner_e}")
+
+        resp = self.client.chat.completions.create(
+            **call_kwargs,
+            temperature=0.1,
+            max_tokens=600,
+        )
+        return resp.choices[0].message.content or "{}"
 
     def _quant_rule_fallback(
         self, symbol: str, features: dict, portfolio_state: dict, trigger_reason: str
     ) -> AIDecisionOutput:
-        """Deterministic rule-based fallback when LLM API key is not supplied."""
         has_pos = portfolio_state.get("position_qty", 0.0) > 0
         last_price = features["last_price"]
         atr = features["atr_14"]
@@ -219,43 +238,50 @@ class CostEffectiveLLMStrategist:
 
         if has_pos:
             unrealized = portfolio_state.get("unrealized_pnl_pct", 0.0)
-            if unrealized <= -self.config.hard_stop_loss_pct or unrealized >= self.config.default_take_profit_pct:
+            if not features["trend_bullish"] and features["obi_top5"] < -0.15 and unrealized > 0.3:
                 return AIDecisionOutput(
                     symbol=symbol,
                     action="SELL",
                     order_type="MARKET",
-                    confidence=0.85,
+                    confidence=0.82,
                     allocation_pct=0.0,
-                    signals_observed=["RULE_EXIT_TP_OR_SL", f"pnl={unrealized:.2%}"],
-                    reasoning_fa=f"خروج از پوزیشن طبق حد سود یا حد ضرر (بازده: {unrealized:.2%})."
+                    signals_observed=["QUANT_REVERSAL_EXIT", f"OBI={features['obi_top5']}"],
+                    reasoning_fa=(
+                        f"خروج تاکتیکی به علت چرخش روند (EMA9 زیر EMA21) و فشار فروش در اردربوک "
+                        f"(OBI={features['obi_top5']}) جهت حفظ سود ({unrealized:.2f}%)."
+                    ),
                 )
             return AIDecisionOutput(
                 symbol=symbol,
                 action="HOLD",
                 order_type="LIMIT",
-                confidence=0.6,
+                confidence=0.65,
                 allocation_pct=0.0,
-                signals_observed=["RULE_POSITION_HOLD"],
-                reasoning_fa="نگهداری پوزیشن؛ هنوز حد سود یا حد ضرر فعال نشده است."
+                signals_observed=["QUANT_POSITION_HOLD"],
+                reasoning_fa="نگهداری پوزیشن باز؛ حد ضرر و تریلینگ استاپ فعال است.",
             )
 
-        # Entry logic
         sl_price = max(last_price - 1.5 * atr, last_price * (1.0 - self.config.hard_stop_loss_pct))
-        tp_price = last_price * (1.0 + self.config.default_take_profit_pct)
+        tp_price = max(last_price + 2.4 * atr, last_price * (1.0 + self.config.default_take_profit_pct))
 
         return AIDecisionOutput(
             symbol=symbol,
             action="BUY",
             order_type="LIMIT",
-            confidence=0.75,
+            confidence=0.76,
             allocation_pct=self.config.max_position_pct,
             limit_price=best_bid,
             stop_loss_price=round(sl_price, 2),
             take_profit_price=round(tp_price, 2),
-            signals_observed=[trigger_reason, f"RSI={features['rsi_14']}", f"OBI={features['obi_top5']}"],
+            signals_observed=[
+                trigger_reason,
+                f"RSI={features['rsi_14']}",
+                f"OBI={features['obi_top5']}",
+                f"ATR%={features.get('atr_pct', 0)}%",
+            ],
             reasoning_fa=(
-                f"سیگنال ورود تحلیلی ({trigger_reason}): RSI برابر {features['rsi_14']}، "
-                f"عدم تعادل اردربوک (OBI) برابر {features['obi_top5']} و اسپرد {features['spread_pct']}٪. "
+                f"ورود الگوریتمی ({trigger_reason}): شاخص RSI={features['rsi_14']}، عدم تعادل دفتر سفارشات "
+                f"OBI={features['obi_top5']}، نسبت خریداران Taker={features['taker_buy_ratio']} و نوسان ATR={features.get('atr_pct', 0)}٪. "
                 f"حد ضرر در {sl_price:,.0f} تومان و حد سود در {tp_price:,.0f} تومان تنظیم شد."
             ),
         )

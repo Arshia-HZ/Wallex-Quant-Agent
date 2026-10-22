@@ -12,7 +12,7 @@ import requests
 import pandas as pd
 from typing import Dict, List, Optional
 from market_compliance import MarketComplianceGuard, normalize_symbol
-from config import AgentConfig
+from config import AgentConfig, ExecutionMode
 
 logger = logging.getLogger("WallexAgent")
 
@@ -35,40 +35,36 @@ class WallexClient:
         self.session.headers.update(headers)
         self.market_rules: Dict[str, dict] = {}
 
-    def load_market_rules(self) -> Dict[str, dict]:
-        """
-        Fetches market rules (precisions, minQty, minNotional, stepSize) from /v1/markets.
-        Ensures execution stability and prevents order rejections.
-        """
-        try:
-            resp = self.session.get(f"{self.config.base_url}/v1/markets", timeout=12)
-            resp.raise_for_status()
-            data = resp.json()
-            symbols_data = data.get("result", {}).get("symbols", {})
+    def load_market_rules(self) -> List[str]:
+        """Fetches market precision rules and enforces the 100,000 TMN minimum notional floor."""
+        resp = self.session.get(f"{self.config.base_url}/v1/markets", timeout=12)
+        resp.raise_for_status()
+        symbols_data = resp.json().get("result", {}).get("symbols", {})
 
-            for sym, info in symbols_data.items():
-                norm = normalize_symbol(sym)
-                # Parse precision safely
-                price_prec = int(info.get("quotePrecision", info.get("quoteAssetPrecision", 0) or 0))
-                qty_prec = int(info.get("baseAssetPrecision", info.get("stepSize", 6) or 6))
-                min_qty = float(info.get("minQty", 0.00000001))
-                min_notional = float(info.get("minNotional", 50000.0))
+        allowed_active = MarketComplianceGuard.filter_active_wallex_markets(
+            symbols_data, top_only=True
+        )
+        for sym in allowed_active:
+            info = symbols_data.get(sym, {})
+            price_prec = int(info.get("quotePrecision", info.get("quoteAssetPrecision", 0) or 0))
+            qty_prec = int(info.get("baseAssetPrecision", info.get("stepSize", 6) or 6))
+            min_qty = float(info.get("minQty", 0.00000001))
+            # Enforce at least 100,000 TMN even if the API metadata reports 50,000 TMN
+            api_min_notional = float(info.get("minNotional", 100_000.0) or 100_000.0)
+            min_notional = max(api_min_notional, self.config.exchange_min_notional_tmn)
 
-                self.market_rules[norm] = {
-                    "symbol": norm,
-                    "price_precision": price_prec,
-                    "qty_precision": qty_prec,
-                    "min_qty": min_qty,
-                    "min_notional": min_notional,
-                    "base_asset": info.get("baseAsset", ""),
-                    "quote_asset": info.get("quoteAsset", "TMN"),
-                }
-
-            logger.info(f"Loaded market rules for {len(self.market_rules)} Wallex symbols.")
-            return self.market_rules
-        except Exception as e:
-            logger.error(f"Failed to load market rules: {e}")
-            raise
+            self.market_rules[sym] = {
+                "base_asset": info.get("baseAsset", sym.replace("TMN", "")),
+                "price_precision": price_prec,
+                "qty_precision": qty_prec,
+                "min_qty": min_qty,
+                "min_notional": min_notional,
+            }
+        logger.info(
+            f"Loaded {len(self.market_rules)} compliant TMN markets "
+            f"(Min Order Floor: {self.config.exchange_min_notional_tmn:,.0f} TMN)"
+        )
+        return list(self.market_rules.keys())
 
     def get_symbol_rule(self, symbol: str) -> dict:
         norm = normalize_symbol(symbol)
@@ -194,25 +190,7 @@ class WallexClient:
             return orders
         except Exception as e:
             logger.error(f"Error fetching open orders: {e}")
-            return None
-
-    def get_order_status(self, client_id: str) -> Optional[dict]:
-        """
-        Queries detailed status of an order via GET /v1/account/orders/{client_id}.
-        Returns dict with status, executedQty, executedPrice, etc., or None on network error.
-        """
-        try:
-            url = f"{self.config.base_url}/v1/account/orders/{client_id}"
-            resp = self.session.get(url, timeout=8)
-            if resp.status_code == 200:
-                return resp.json().get("result", {})
-            elif resp.status_code == 404:
-                return {"status": "NOT_FOUND", "active": False}
-            logger.warning(f"Order status check for {client_id} returned HTTP {resp.status_code}")
-            return None
-        except Exception as e:
-            logger.warning(f"Error checking order status for {client_id}: {e}")
-            return None
+            return []
 
     def cancel_order(self, client_id: str) -> bool:
         """
@@ -241,22 +219,35 @@ class WallexClient:
         order_type: str,
         quantity: float,
         price: Optional[float] = None,
-        client_id: Optional[str] = None,
+        reference_price: Optional[float] = None,
     ) -> dict:
         """
-        Places a spot order on Wallex with strict compliance and precision checks.
+        Places a spot order after verifying:
+        1. Symbol is not in the 326 forbidden markets.
+        2. Post-rounding notional value (formatted_qty * price) is >= 100,000 TMN.
         """
-        # 1. HARD REGULATORY GUARD: Verify market is allowed and uses TMN quote
         norm_symbol = MarketComplianceGuard.assert_market_allowed(symbol)
+        rule = self.market_rules.get(norm_symbol, {})
+        min_notional = max(
+            rule.get("min_notional", 100_000.0), self.config.exchange_min_notional_tmn
+        )
 
-        # 2. Format precision
         formatted_qty = self.format_quantity(norm_symbol, quantity)
-        if float(formatted_qty) <= 0:
-            raise ValueError(f"Order quantity {quantity} formatted to 0. Cannot submit.")
+        final_qty_float = float(formatted_qty)
+        if final_qty_float <= 0:
+            raise ValueError(f"Formatted quantity for {norm_symbol} is zero ({quantity})")
 
-        if not client_id:
-            client_id = f"agy_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        # Determine effective price to validate the 100,000 TMN minimum notional requirement
+        check_price = price or reference_price
+        if check_price is not None:
+            notional_tmn = final_qty_float * float(check_price)
+            if notional_tmn < min_notional:
+                raise ValueError(
+                    f"LOW_AMOUNT_GUARD: {norm_symbol} {side} order value after rounding is "
+                    f"{notional_tmn:,.0f} TMN, which is below Wallex's {min_notional:,.0f} TMN minimum!"
+                )
 
+        client_id = f"wlx_{int(time.time()*1000)}_{uuid.uuid4().hex[:5]}"
         payload = {
             "symbol": norm_symbol,
             "type": order_type.upper(),
@@ -264,21 +255,24 @@ class WallexClient:
             "quantity": formatted_qty,
             "client_id": client_id,
         }
-
         if order_type.upper() == "LIMIT":
             if price is None:
-                raise ValueError("Price is required for LIMIT order.")
+                raise ValueError("Price is required for LIMIT order")
             payload["price"] = self.format_price(norm_symbol, price)
 
-        # 3. Minimum notional check
-        rule = self.get_symbol_rule(norm_symbol)
-        est_price = price if price is not None else 1.0
-        notional = float(formatted_qty) * est_price
-        if price is not None and notional < rule["min_notional"]:
-            raise ValueError(
-                f"Order notional {notional:.0f} TMN is below minimum {rule['min_notional']} TMN."
-            )
+        if self.config.mode == ExecutionMode.SHADOW:
+            return {
+                "status": "SHADOW_SUBMITTED",
+                "clientOrderId": client_id,
+                "symbol": norm_symbol,
+                "side": side.upper(),
+                "type": order_type.upper(),
+                "origQty": formatted_qty,
+                "price": payload.get("price", str(check_price or 0.0)),
+            }
 
-        resp = self.session.post(f"{self.config.base_url}/v1/account/orders", json=payload, timeout=12)
+        resp = self.session.post(
+            f"{self.config.base_url}/v1/account/orders", json=payload, timeout=12
+        )
         resp.raise_for_status()
         return resp.json().get("result", {})

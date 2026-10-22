@@ -1,122 +1,106 @@
 # config.py
-"""
-Configuration module for Wallex AI Trading Agent.
-Loads configuration from environment variables (.env) with production-ready defaults.
-"""
-
 import os
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Tuple
 from dotenv import load_dotenv
 
-# Load variables from .env file if present
 load_dotenv()
 
 
 class ExecutionMode(str, Enum):
     BACKTEST = "BACKTEST"
-    SHADOW = "SHADOW"   # Live market feed + AI reasoning, simulated order execution
-    LIVE = "LIVE"       # Live execution on Wallex contest account
+    SHADOW = "SHADOW"
+    LIVE = "LIVE"
 
 
 @dataclass
 class AgentConfig:
-    # Wallex Credentials & Endpoint
     api_key: str = field(default_factory=lambda: os.getenv("WALLEX_API_KEY", ""))
-    base_url: str = field(default_factory=lambda: os.getenv("WALLEX_BASE_URL", "https://api.wallex.ir").rstrip("/"))
-
-    # Execution Mode
+    base_url: str = field(
+        default_factory=lambda: os.getenv("WALLEX_BASE_URL", "https://api.wallex.ir").rstrip("/")
+    )
     mode: ExecutionMode = field(
         default_factory=lambda: ExecutionMode(os.getenv("EXECUTION_MODE", "SHADOW").upper())
     )
 
-    # Contest Capital & Allocation
+    # Capital & Risk Guardrails (60 Points Total: 30 Risk Mgmt + 30 Drawdown Control)
     initial_capital_tmn: float = field(
         default_factory=lambda: float(os.getenv("INITIAL_CAPITAL_TMN", "5000000.0"))
     )
-    allowed_symbols: Tuple[str, ...] = (
-        "BTCTMN",
-        "ETHTMN",
-        "SOLTMN",
-        "XRPTMN",
-        "USDTTMN",
-        "DOGETMN",
-        "BNBTMN",
-        "TRXTMN",
-    )
-
-    # Risk Management & Position Sizing
     max_position_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.22"))
-    )  # Max 22% (1.1M TMN) per position
+    )
     min_cash_reserve_pct: float = field(
         default_factory=lambda: float(os.getenv("MIN_CASH_RESERVE_PCT", "0.20"))
-    )  # Keep 20% (1.0M TMN) always in reserve
+    )
     max_concurrent_positions: int = field(
         default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
     )
-    max_spread_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.25"))
-    )  # Skip illiquid order books with spread > 0.25%
-
-    # Stop Loss & Take Profit
-    hard_stop_loss_pct: float = field(
-        default_factory=lambda: float(os.getenv("HARD_STOP_LOSS_PCT", "0.012"))
-    )  # 1.2% hard stop-loss
-    default_take_profit_pct: float = field(
-        default_factory=lambda: float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "0.022"))
-    )  # 2.2% target take-profit
-    trailing_stop_activation_pct: float = field(
-        default_factory=lambda: float(os.getenv("TRAILING_STOP_ACTIVATION_PCT", "0.010"))
-    )  # Activate trailing stop when unrealized gain >= 1.0%
-    trailing_stop_distance_pct: float = field(
-        default_factory=lambda: float(os.getenv("TRAILING_STOP_DISTANCE_PCT", "0.007"))
-    )  # Trail 0.7% behind peak price
-
-    # Portfolio Drawdown Circuit Breaker
-    max_portfolio_drawdown_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_PORTFOLIO_DRAWDOWN_PCT", "0.035"))
-    )  # 3.5% total drawdown circuit breaker
-
-    # Order Lifecycle & Stale Orders
-    stale_order_timeout_seconds: int = field(
-        default_factory=lambda: int(os.getenv("STALE_ORDER_TIMEOUT_SECONDS", "180"))
-    )  # Cancel unfilled LIMIT orders after 3 minutes (180s)
+    exchange_min_notional_tmn: float = field(
+        default_factory=lambda: float(os.getenv("EXCHANGE_MIN_NOTIONAL_TMN", "100000.0"))
+    )
     min_order_tmn: float = field(
         default_factory=lambda: float(os.getenv("MIN_ORDER_TMN", "150000.0"))
-    )  # Safe buffer above Wallex 50,000 TMN minNotional
-    fee_rate: float = field(
+    )
+    fee_rate_per_side: float = field(
         default_factory=lambda: float(os.getenv("FEE_RATE", "0.002"))
-    )  # 0.2% maker/taker fee for realistic shadow accounting
+    )
 
-    # Loop Timing & Execution
-    loop_interval_seconds: int = field(
-        default_factory=lambda: int(os.getenv("LOOP_INTERVAL_SECONDS", "45"))
-    )  # Scan frequency
+    # Stop-Loss, Take-Profit & Trailing Stop Parameters
+    hard_stop_loss_pct: float = field(
+        default_factory=lambda: float(os.getenv("HARD_STOP_LOSS_PCT", "0.012"))
+    )
+    default_take_profit_pct: float = field(
+        default_factory=lambda: float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "0.020"))
+    )
+    trailing_activation_pct: float = field(
+        default_factory=lambda: float(os.getenv("TRAILING_STOP_ACTIVATION_PCT", "0.009"))
+    )
+    trailing_distance_pct: float = field(
+        default_factory=lambda: float(os.getenv("TRAILING_STOP_DISTANCE_PCT", "0.005"))
+    )
+    max_portfolio_drawdown_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_PORTFOLIO_DRAWDOWN_PCT", "0.035"))
+    )
 
-    # Contest Liquidation Deadline
+    # Microstructure & Cadence Optimized for 36-Hour Contest Window
+    candle_resolution: str = field(
+        default_factory=lambda: os.getenv("CANDLE_RESOLUTION", "15")
+    )
+    min_atr_pct: float = field(
+        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.32"))
+    )  # Blocks dead/flat markets that cannot beat 0.4% round-trip fee
+    max_spread_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.25"))
+    )
+    loop_interval_sec: int = field(
+        default_factory=lambda: int(os.getenv("LOOP_INTERVAL_SECONDS", "40"))
+    )
+    stale_order_timeout_sec: int = field(
+        default_factory=lambda: int(os.getenv("STALE_ORDER_TIMEOUT_SECONDS", "180"))
+    )
+    llm_hold_cooldown_sec: int = field(
+        default_factory=lambda: int(os.getenv("LLM_HOLD_COOLDOWN_SECONDS", "240"))
+    )
     contest_end_timestamp: int = field(
-        default_factory=lambda: int(os.getenv("CONTEST_END_TIMESTAMP", "1792771200"))
+        default_factory=lambda: int(os.getenv("CONTEST_END_TIMESTAMP", "0"))
     )
-    flatten_minutes_before_end: int = field(
-        default_factory=lambda: int(os.getenv("FLATTEN_MINUTES_BEFORE_END", "25"))
+    flatten_before_end_sec: int = field(
+        default_factory=lambda: int(os.getenv("FLATTEN_MINUTES_BEFORE_END", "25")) * 60
     )
 
-    # Persistence & Audit Logging
+    # Deliverable Files
     decision_log_file: str = field(
         default_factory=lambda: os.getenv("DECISION_LOG_FILE", "decision_logs.jsonl")
     )
-    portfolio_state_file: str = field(
+    state_file: str = field(
         default_factory=lambda: os.getenv("PORTFOLIO_STATE_FILE", "portfolio_state.json")
     )
 
-    # LLM Settings (Configured for BoxAPI & GPT-6 Luna)
+    # LLM Settings
     llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
     llm_base_url: str = field(
-        default_factory=lambda: os.getenv(
-            "LLM_BASE_URL", "https://ai.boxapi.ir/ai/v1"
-        )
+        default_factory=lambda: os.getenv("LLM_BASE_URL", "https://ai.boxapi.ir/ai/v1")
     )
     llm_model: str = field(
         default_factory=lambda: os.getenv("LLM_MODEL", "gpt-6-luna")
@@ -124,3 +108,20 @@ class AgentConfig:
     llm_reasoning_effort: str = field(
         default_factory=lambda: os.getenv("LLM_REASONING_EFFORT", "medium")
     )
+
+    # Aliases for compatibility with backtest_engine.py / state_manager.py / shadow_simulator.py
+    @property
+    def fee_rate(self) -> float:
+        return self.fee_rate_per_side
+
+    @property
+    def portfolio_state_file(self) -> str:
+        return self.state_file
+
+    @property
+    def trailing_stop_activation_pct(self) -> float:
+        return self.trailing_activation_pct
+
+    @property
+    def trailing_stop_distance_pct(self) -> float:
+        return self.trailing_distance_pct

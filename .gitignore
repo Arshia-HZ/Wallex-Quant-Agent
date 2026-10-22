@@ -47,3 +47,6 @@ portfolio_state.json
 *.swo
 .DS_Store
 Thumbs.db
+
+.claude/
+.agents/
