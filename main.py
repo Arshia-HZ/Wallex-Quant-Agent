@@ -137,18 +137,25 @@ class WallexClient:
             logger.warning(f"Error fetching latest trades for {norm}: {e}")
             return []
 
-    def get_candles(self, symbol: str, resolution: str = "15", lookback_hours: int = 36) -> pd.DataFrame:
+    def get_candles(
+        self, symbol: str, resolution: str = "15", lookback_hours: int = 72
+    ) -> pd.DataFrame:
+        """
+        Fetches historical OHLCV candle data via /v1/udf/history.
+        Automatically resamples 1m data to true 15m or 60m candles if Wallex returns 1m resolution.
+        """
         norm = normalize_symbol(symbol)
         now = int(time.time())
         frm = now - (lookback_hours * 3600)
         params = {"symbol": norm, "resolution": resolution, "from": frm, "to": now}
         try:
-            resp = self.session.get(f"{self.config.base_url}/v1/udf/history", params=params, timeout=12)
+            resp = self.session.get(f"{self.config.base_url}/v1/udf/history", params=params, timeout=25)
             resp.raise_for_status()
             data = resp.json()
             if data.get("s") != "ok" or not data.get("t"):
                 return pd.DataFrame()
-            return pd.DataFrame({
+
+            df = pd.DataFrame({
                 "timestamp": data["t"],
                 "open": [float(x) for x in data["o"]],
                 "high": [float(x) for x in data["h"]],
@@ -156,6 +163,22 @@ class WallexClient:
                 "close": [float(x) for x in data["c"]],
                 "volume": [float(x) for x in data["v"]],
             })
+
+            # Wallex UDF API returns 1-minute candles even when resolution="15" is requested.
+            # Resample into proper 15-minute or 60-minute candles for accurate multi-candle quant indicators.
+            if len(df) > 2 and (df["timestamp"].iloc[1] - df["timestamp"].iloc[0]) <= 120 and resolution in ("15", "60"):
+                freq = "15min" if resolution == "15" else "60min"
+                df["dt"] = pd.to_datetime(df["timestamp"], unit="s")
+                df = df.set_index("dt").resample(freq).agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                    "timestamp": "first",
+                }).dropna().reset_index(drop=True)
+
+            return df
         except Exception as e:
             logger.warning(f"Error fetching candles for {norm}: {e}")
             return pd.DataFrame()
@@ -663,7 +686,7 @@ class TradingAgentRunner:
         for sym in active_markets:
             try:
                 ob = self.client.get_orderbook(sym)
-                df = self.client.get_candles(sym, resolution=self.config.candle_resolution, lookback_hours=36)
+                df = self.client.get_candles(sym, resolution=self.config.candle_resolution, lookback_hours=72)
                 trades = self.client.get_latest_trades(sym)
                 feats = QuantFeatureEngine.compute_features(df, ob, trades)
                 if not feats.get("valid"):
@@ -753,11 +776,10 @@ class TradingAgentRunner:
         buy_fee_rate = self.config.taker_fee_rate if decision.order_type == "MARKET" else self.config.maker_fee_rate
         raw_qty = (order_tmn * (1.0 - buy_fee_rate)) / exec_price
 
-        # FIX: Scale 15-min ATR to hourly equivalent for realistic SL placement
-        hourly_atr = feats["atr_14"] * 2.0
-        atr_sl = exec_price - (2.0 * hourly_atr)
+        atr_sl = exec_price - (1.5 * feats["atr_14"])
         hard_sl = exec_price * (1.0 - self.config.hard_stop_loss_pct)
-        sl_price = min(atr_sl, hard_sl)  # min() picks the WIDER (safer) stop
+        # max() ensures stop-loss never exceeds the -1.2% hard limit
+        sl_price = max(atr_sl, hard_sl)
         if decision.stop_loss_price and hard_sl <= decision.stop_loss_price < exec_price:
             sl_price = decision.stop_loss_price
 

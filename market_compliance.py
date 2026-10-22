@@ -63,8 +63,6 @@ PRIORITY_ALLOWED_TMN_MARKETS: List[str] = [
     "ETHTMN",   # Ethereum
     "SOLTMN",   # Solana
     "XRPTMN",   # Ripple
-    "USDTTMN",  # Tether
-    "TRXTMN",   # Tron
     "DOGETMN",  # Dogecoin
     "BNBTMN",   # Binance Coin
     "ADATMN",   # Cardano
@@ -74,6 +72,7 @@ PRIORITY_ALLOWED_TMN_MARKETS: List[str] = [
     "DOTTMN",   # Polkadot
     "SHIBTMN",  # Shiba Inu
     "ARBTMN",   # Arbitrum
+    "TRXTMN",   # Tron
 ]
 
 

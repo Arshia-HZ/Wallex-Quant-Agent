@@ -9,7 +9,6 @@ and computes quantitative metrics: Win Rate, Profit Factor, Max Drawdown, and Re
 import sys
 import logging
 import pandas as pd
-from datetime import datetime, timezone
 from config import AgentConfig, ExecutionMode
 from wallex_client import WallexClient
 from quant_engine import QuantFeatureEngine
@@ -28,7 +27,6 @@ class StrategyBacktester:
         self.initial_capital = config.initial_capital_tmn
         self.maker_fee = getattr(config, "maker_fee_rate", 0.0025)
         self.taker_fee = getattr(config, "taker_fee_rate", 0.0030)
-        self.fee_rate = self.taker_fee
 
     def run(self) -> dict:
         norm_sym = MarketComplianceGuard.assert_market_allowed(self.symbol)
@@ -45,68 +43,58 @@ class StrategyBacktester:
         peak_capital = capital_tmn
         max_drawdown = 0.0
 
-        position = None  # None or dict: {qty, entry_price, peak_price, sl, tp, fee}
+        position = None
         trades_history = []
-        last_exit_candle_idx = -20  # Re-entry cooldown tracker
+        last_exit_candle_idx = -20
 
-        # Iterate candle by candle
-        for i in range(30, len(df)):
+        for i in range(40, len(df)):
             sub_df = df.iloc[: i + 1]
             curr_candle = df.iloc[i]
             curr_price = float(curr_candle["close"])
             high_price = float(curr_candle["high"])
             low_price = float(curr_candle["low"])
 
-            # Synthesize approximate orderbook top of book
             synth_orderbook = {
-                "bid": [{"price": curr_price * 0.9995, "quantity": 1.0}],
-                "ask": [{"price": curr_price * 1.0005, "quantity": 1.0}],
+                "bid": [{"price": curr_price * 0.9996, "quantity": 1.0}],
+                "ask": [{"price": curr_price * 1.0004, "quantity": 1.0}],
             }
 
             features = QuantFeatureEngine.compute_features(sub_df, synth_orderbook)
             if not features.get("valid", False):
                 continue
 
-            # Update current equity & drawdown
-            current_equity = capital_tmn
-            if position:
-                current_equity += position["qty"] * curr_price
+            current_equity = capital_tmn + (position["qty"] * curr_price if position else 0.0)
             if current_equity > peak_capital:
                 peak_capital = current_equity
             dd = (peak_capital - current_equity) / peak_capital
             if dd > max_drawdown:
                 max_drawdown = dd
 
-            # 1. Manage Open Position (Trailing Stop / Stop-Loss / Take-Profit)
+            # 1. Manage Open Position
             if position:
-                if high_price > position["peak_price"]:
-                    position["peak_price"] = high_price
-
-                # Trailing stop update with healthy breathing room to reach Take Profit
-                gain = (position["peak_price"] - position["entry_price"]) / position["entry_price"]
-                if gain >= 0.018:
-                    breakeven_sl = position["entry_price"] * (1.0 + self.maker_fee + self.taker_fee + 0.002)
-                    trail_sl = position["peak_price"] * (1.0 - 0.010)
-                    new_sl = max(position["sl"], breakeven_sl, trail_sl)
-                    if new_sl > position["sl"]:
-                        position["sl"] = new_sl
-
-                # Exit checks
+                bars_held = i - position["entry_idx"]
                 exit_price = None
                 exit_reason = ""
 
+                # Check SL / TP against current bar BEFORE updating trailing peak from the same bar's high
                 if low_price <= position["sl"]:
                     exit_price = position["sl"]
                     exit_reason = "TRAILING_STOP" if position["sl"] > position["entry_price"] else "STOP_LOSS"
                 elif position["tp"] and high_price >= position["tp"]:
                     exit_price = position["tp"]
                     exit_reason = "TAKE_PROFIT"
-                elif features["rsi_14"] > 74 and not features["trend_bullish"]:
+                # Early Stagnation / Trend-Breakdown Exit: cuts dead trades before they hit full -1.20% SL
+                elif bars_held >= 6 and not features["trend_bullish"] and features["rsi_14"] < 45.0 and curr_price < position["entry_price"]:
                     exit_price = curr_price
-                    exit_reason = "MOMENTUM_REVERSAL"
+                    exit_reason = "EARLY_TREND_BREAK_EXIT"
+                elif features["rsi_14"] > 74.0 and curr_price > position["entry_price"] * 1.012:
+                    exit_price = curr_price
+                    exit_reason = "OVERBOUGHT_PROFIT_TAKE"
 
                 if exit_price:
-                    fee = position["qty"] * exit_price * self.taker_fee
+                    # Take-Profit limit exits fill at Maker fee (0.25%); Stop/Market exits fill at Taker fee (0.30%)
+                    exit_fee_rate = self.maker_fee if exit_reason == "TAKE_PROFIT" else self.taker_fee
+                    fee = position["qty"] * exit_price * exit_fee_rate
                     gross_pnl = (exit_price - position["entry_price"]) * position["qty"]
                     net_pnl = gross_pnl - position["entry_fee"] - fee
                     capital_tmn += (position["qty"] * exit_price) - fee
@@ -125,34 +113,69 @@ class StrategyBacktester:
                     position = None
                     continue
 
-            # 2. Check Entry Setup
-            if not position:
-                # Check circuit breaker
+                # Update peak and ratchet trailing stop for subsequent bars
+                if high_price > position["peak_price"]:
+                    position["peak_price"] = high_price
+
+                gain = (position["peak_price"] - position["entry_price"]) / position["entry_price"]
+                if gain >= 0.017:
+                    # Lock at least +1.20% gross (+0.65% net after fees) once price has rallied +1.7%
+                    min_profit_lock = position["entry_price"] * 1.012
+                    trail_sl = position["peak_price"] * (1.0 - 0.006)
+                    new_sl = max(position["sl"], min_profit_lock, trail_sl)
+                    if new_sl > position["sl"]:
+                        position["sl"] = new_sl
+
+            # 2. Check Entry Setup (Do not open new positions in the final 10 bars before flatten deadline!)
+            if not position and i < (len(df) - 10):
                 if dd >= self.config.max_portfolio_drawdown_pct:
                     continue
 
-                # Adaptive cooldown: avoid rapid churning
                 last_was_loss = bool(trades_history and trades_history[-1]["net_pnl_tmn"] <= 0)
-                cooldown_bars = 6 if last_was_loss else 3
+                cooldown_bars = 8 if last_was_loss else 3
                 if (i - last_exit_candle_idx) < cooldown_bars:
                     continue
 
-                rsi = features["rsi_14"]
-                trend_up = features["trend_bullish"]
-                vol_z = features["volume_zscore"]
-                trend_str = features.get("trend_strength_pct", 0.0)
+                # Volatility must be large enough to clear Wallex's 0.55% round-trip fee
+                if features["atr_pct"] < 0.35:
+                    continue
 
-                # Macro Trend Filter: EMA50 ensures we never buy pullbacks in a broader downtrend
-                close_series = sub_df["close"].astype(float)
-                ema50 = float(close_series.ewm(span=50, adjust=False).mean().iloc[-1])
-                is_macro_uptrend = (curr_price > ema50)
+                rsi = features["rsi_14"]
+                vol_z = features["volume_zscore"]
+                bullish_rebound = features["bullish_rebound"]
+                rsi_turning_up = features["rsi_turning_up"]
 
                 is_buy = False
-                # Setup 1: High-conviction trend pullback (in verified macro uptrend)
-                if is_macro_uptrend and trend_up and trend_str >= 0.04 and (40.0 <= rsi <= 56.0):
+                # Setup 1: Confirmed Macro Uptrend + Pullback that has ACTUALLY turned green/bounced
+                if (
+                    features["macro_uptrend"]
+                    and features["trend_bullish"]
+                    and features["trend_strength_pct"] >= 0.08
+                    and (42.0 <= rsi <= 58.0)
+                    and bullish_rebound
+                    and rsi_turning_up
+                ):
                     is_buy = True
-                # Setup 2: Deep oversold mean-reversion bounce
-                elif rsi < 30.0 and vol_z > 1.0:
+
+                # Setup 2: Oversold Spring Reversal (Previous bars dipped <30 RSI, current bar is a strong green rebound)
+                elif (
+                    features["min_rsi_last3"] < 30.0
+                    and rsi >= 31.0
+                    and bullish_rebound
+                    and rsi_turning_up
+                    and vol_z > 0.3
+                ):
+                    is_buy = True
+
+                # Setup 3: High-Volume Fresh Breakout in Macro Uptrend
+                elif (
+                    features["macro_uptrend"]
+                    and features["trend_bullish"]
+                    and vol_z >= 1.8
+                    and features["roc_3_pct"] >= 0.45
+                    and bullish_rebound
+                    and (52.0 <= rsi <= 65.0)
+                ):
                     is_buy = True
 
                 if is_buy and capital_tmn >= self.config.min_order_tmn:
@@ -160,13 +183,16 @@ class StrategyBacktester:
                     entry_price = curr_price
                     qty = target_tmn / entry_price
 
-                    # Reliable Stop-Loss: 1.2% hard stop
+                    # Cap Stop-Loss strictly at hard_stop_loss_pct (1.1% - 1.2%)
                     hard_sl = entry_price * (1.0 - self.config.hard_stop_loss_pct)
-                    atr_sl = entry_price - (1.5 * features["atr_14"])
-                    sl = min(atr_sl, hard_sl)
+                    atr_sl = entry_price - (1.8 * features["atr_14"])
+                    sl = max(atr_sl, hard_sl)
 
                     entry_fee = target_tmn * self.maker_fee
-                    tp = entry_price * (1.0 + self.config.default_take_profit_pct)
+                    tp = max(
+                        entry_price + (3.2 * features["atr_14"]),
+                        entry_price * (1.0 + self.config.default_take_profit_pct),
+                    )
 
                     capital_tmn -= (target_tmn + entry_fee)
                     position = {
@@ -177,6 +203,7 @@ class StrategyBacktester:
                         "tp": tp,
                         "entry_fee": entry_fee,
                         "entry_time": curr_candle["timestamp"],
+                        "entry_idx": i,
                     }
 
         # Close any open position at the end (Contest Rule: Liquidate to TMN)
@@ -196,7 +223,6 @@ class StrategyBacktester:
                 "reason": "END_OF_TEST_FLATTEN",
             })
 
-        # Calculate performance statistics
         total_trades = len(trades_history)
         winning_trades = [t for t in trades_history if t["net_pnl_tmn"] > 0]
         losing_trades = [t for t in trades_history if t["net_pnl_tmn"] <= 0]
@@ -222,7 +248,6 @@ class StrategyBacktester:
             "profit_factor": round(profit_factor, 2),
         }
 
-        # Print Backtest Summary
         print("\n" + "=" * 60)
         print("          WALLEX STRATEGY BACKTEST RESULTS REPORT")
         print("=" * 60)
@@ -240,7 +265,10 @@ class StrategyBacktester:
             print("\nTrade Execution Log:")
             for idx, t in enumerate(trades_history, 1):
                 win_loss = "WIN " if t["net_pnl_tmn"] > 0 else "LOSS"
-                print(f"  #{idx:02d} [{win_loss}] Return: {t['return_pct']*100:+.2f}% | Net: {t['net_pnl_tmn']:+,.0f} TMN | Exit: {t['reason']}")
+                print(
+                    f"  #{idx:02d} [{win_loss}] Return: {t['return_pct']*100:+.2f}% | "
+                    f"Net: {t['net_pnl_tmn']:+,.0f} TMN | Exit: {t['reason']}"
+                )
             print("=" * 60 + "\n")
 
         return report

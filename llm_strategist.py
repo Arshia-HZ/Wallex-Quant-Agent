@@ -116,20 +116,43 @@ class CostEffectiveLLMStrategist:
         obi = features.get("obi_top5", 0.0)
         taker_buy = features.get("taker_buy_ratio", 0.5)
         trend_bullish = features.get("trend_bullish", False)
+        macro_uptrend = features.get("macro_uptrend", False)
+        bullish_rebound = features.get("bullish_rebound", False)
+        rsi_turning_up = features.get("rsi_turning_up", False)
+        min_rsi_last3 = features.get("min_rsi_last3", 50.0)
         vol_z = features.get("volume_zscore", 0.0)
-        bb_pos = features.get("bb_position", 0.5)
         roc_3 = features.get("roc_3_pct", 0.0)
 
-        # Setup 1: Bullish trend pullback with order book or trade flow support
-        if trend_bullish and (36.0 <= rsi <= 63.0) and (obi >= 0.10 or taker_buy >= 0.56):
-            return True, "TREND_PULLBACK_WITH_FLOW_SUPPORT"
+        # Setup 1: Confirmed Macro Uptrend pullback that has turned green with order-book bid support
+        if (
+            macro_uptrend
+            and trend_bullish
+            and bullish_rebound
+            and rsi_turning_up
+            and (40.0 <= rsi <= 58.0)
+            and (obi >= 0.10 or taker_buy >= 0.55)
+        ):
+            return True, "CONFIRMED_UPTREND_PULLBACK_REBOUND"
 
-        # Setup 2: Oversold / Lower Bollinger Band bounce with buyer absorption
-        if (rsi < 34.0 or bb_pos < 0.15) and (obi >= 0.16 or taker_buy >= 0.55):
-            return True, "OVERSOLD_BOLLINGER_REVERSAL_SETUP"
+        # Setup 2: Oversold Spring Reversal (dipped <31 RSI recently, now bouncing green with buyer absorption)
+        if (
+            min_rsi_last3 < 31.0
+            and rsi >= 31.0
+            and bullish_rebound
+            and rsi_turning_up
+            and (obi >= 0.16 or taker_buy >= 0.56)
+        ):
+            return True, "OVERSOLD_SPRING_REVERSAL_SETUP"
 
-        # Setup 3: High-volume momentum breakout
-        if (vol_z >= 1.5 or roc_3 >= 0.40) and obi >= 0.14 and rsi < 67.0:
+        # Setup 3: High-volume momentum breakout in Macro Uptrend
+        if (
+            macro_uptrend
+            and trend_bullish
+            and bullish_rebound
+            and (vol_z >= 1.6 or roc_3 >= 0.45)
+            and obi >= 0.15
+            and (50.0 <= rsi <= 65.0)
+        ):
             return True, "HIGH_VOLUME_MOMENTUM_BREAKOUT"
 
         return False, "NO_EDGE_MARKET_NEUTRAL"
