@@ -94,6 +94,9 @@ class PortfolioStateManager:
                 # Check on-chain / exchange holdings for open positions
                 active_symbols = list(self.state.positions.keys())
                 for sym in active_symbols:
+                    if sym in self.state.pending_sell_orders:
+                        # Retain position while sell order is pending on Wallex
+                        continue
                     rule = self.client.get_symbol_rule(sym)
                     base_asset = rule.get("base_asset", "")
                     asset_info = balances.get(base_asset, {})
@@ -118,6 +121,16 @@ class PortfolioStateManager:
             self.state.available_tmn + self.state.locked_tmn + positions_value_tmn
         )
         self.state.peak_equity_tmn = max(self.state.peak_equity_tmn, self.state.total_equity_tmn)
+        self.save_state()
+
+    def record_pending_sell_order(self, symbol: str, order_data: dict):
+        norm = normalize_symbol(symbol)
+        self.state.pending_sell_orders[norm] = order_data
+        self.save_state()
+
+    def remove_pending_sell_order(self, symbol: str):
+        norm = normalize_symbol(symbol)
+        self.state.pending_sell_orders.pop(norm, None)
         self.save_state()
 
     def record_open_order(self, order: OpenOrderRecord):
@@ -147,10 +160,11 @@ class PortfolioStateManager:
         stop_loss_price: float,
         take_profit_price: Optional[float],
         fee_tmn: float = 0.0,
+        cost_tmn: Optional[float] = None,
     ):
-        """Records a new open position and updates available TMN."""
+        """Records a new open position and updates available TMN with exact cash spent."""
         norm = normalize_symbol(symbol)
-        total_cost = quantity * entry_price
+        total_cost = cost_tmn if cost_tmn is not None else ((quantity * entry_price) + fee_tmn)
         pos = PositionState(
             symbol=norm,
             quantity=quantity,
@@ -167,11 +181,11 @@ class PortfolioStateManager:
 
         # Deduct cost from cash in simulated mode (in live mode sync_with_wallex_balances handles it)
         if self.config.mode != ExecutionMode.LIVE:
-            self.state.available_tmn = max(0.0, self.state.available_tmn - total_cost - fee_tmn)
+            self.state.available_tmn = max(0.0, self.state.available_tmn - total_cost)
 
         self.save_state()
         logger.info(
-            f"OPENED POSITION: {norm} Qty={quantity} @ {entry_price:,.0f} TMN | "
+            f"OPENED POSITION: {norm} Qty={quantity} @ {entry_price:,.0f} TMN | Cost={total_cost:,.0f} TMN | "
             f"SL={stop_loss_price:,.0f} TMN"
         )
 
@@ -225,8 +239,8 @@ class PortfolioStateManager:
             return 0.0, 0.0
 
         revenue_tmn = pos.quantity * exit_price
-        gross_pnl_tmn = revenue_tmn - pos.total_cost_tmn
-        net_pnl_tmn = gross_pnl_tmn - pos.accumulated_fees_tmn - fee_tmn
+        gross_pnl_tmn = revenue_tmn - (pos.quantity * pos.entry_price)
+        net_pnl_tmn = (revenue_tmn - fee_tmn) - pos.total_cost_tmn
         pnl_pct = (net_pnl_tmn / pos.total_cost_tmn) if pos.total_cost_tmn > 0 else 0.0
 
         # Update portfolio state
@@ -241,6 +255,7 @@ class PortfolioStateManager:
             self.state.available_tmn += (revenue_tmn - fee_tmn)
 
         del self.state.positions[norm]
+        self.state.pending_sell_orders.pop(norm, None)
         self.save_state()
 
         logger.info(

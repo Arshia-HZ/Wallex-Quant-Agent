@@ -31,7 +31,7 @@ You must output ONLY valid JSON matching this schema:
   "action": "BUY" | "SELL" | "HOLD",
   "order_type": "LIMIT" | "MARKET",
   "confidence": float (0.0 to 1.0),
-  "allocation_pct": float (0.0 to 0.22),
+  "allocation_pct": float (0.0 to 0.40),
   "limit_price": float or null,
   "stop_loss_price": float or null,
   "take_profit_price": float or null,
@@ -40,12 +40,12 @@ You must output ONLY valid JSON matching this schema:
 }
 
 DECISION LOGIC & CONTEST RULES:
-1. FEE & VOLATILITY GUARD: Wallex Credit Account charges 0.25% Maker and 0.30% Taker (~0.55%-0.60% round-trip). Never BUY if spread_pct > 0.55% or atr_pct < 0.22% (insufficient volatility to cover fees).
+1. FEE & VOLATILITY GUARD: Wallex Credit Account charges 0.25% Maker and 0.30% Taker (~0.55%-0.60% round-trip). Never BUY if spread_pct > 0.55% or atr_pct < 0.35% (insufficient volatility to cover fees).
 2. BUY requires confluence of independent signals:
    - Setup A (Trend Pullback): macro_uptrend is true, trend_bullish is true (EMA9 > EMA21), RSI_14 between 38 and 62, and (obi_top5 >= +0.08 or taker_buy_ratio >= 0.52).
    - Setup B (Orderbook Buyer Absorption): strong buyer depth (obi_top5 >= +0.25) and aggressive buying (taker_buy_ratio >= 0.58) with positive momentum.
    - Setup C (Momentum Breakout): macro_uptrend is true, volume_zscore >= 1.2 or roc_3_pct >= 0.35%, obi_top5 >= +0.10, and RSI_14 < 68.
-   VETO (return HOLD) if any of these red flags is present: bullish_rebound is false AND rsi_turning_up is false (falling knife), price is far above the upper Bollinger band (bb_position > 1.0), obi_top5 is negative while taker_buy_ratio < 0.5, or the spread is large relative to atr_pct.
+   VETO (return HOLD) if any of these red flags is present: trend_bullish is false, price < ema50 (counter-trend), bb_position > 0.75 (overbought top), obi_top5 < 0 (negative buy depth), atr_pct < 0.35%, or bullish_rebound is false AND rsi_turning_up is false (falling knife).
 3. Order Pricing: Entries are executed by the risk engine at the best ask (taker) because passive bids suffer adverse selection and save only 0.05% in fees. Set order_type "MARKET" and limit_price null for BUY.
 4. Risk Bounds (enforced by the executor, which clamps anything outside these ranges):
    - stop_loss_price: between 0.8% and 1.4% below the entry price. Normally max(entry - 1.8 * atr_14, entry * (1 - 0.014)) floored at -0.8%. A tighter stop sits inside normal noise and loses stop distance PLUS fees. Use null to accept the engine default.
@@ -175,13 +175,28 @@ class CostEffectiveLLMStrategist:
             return False, f"SPREAD_TOO_WIDE_{spread:.2f}%"
 
         atr_pct = features.get("atr_pct", 0.5)
-        if atr_pct < self.config.min_atr_pct:
-            return False, f"LOW_VOLATILITY_ATR_{atr_pct:.2f}%_BELOW_FEE_HURDLE"
+        if atr_pct < max(0.35, self.config.min_atr_pct):
+            return False, f"LOW_VOLATILITY_ATR_{atr_pct:.2f}%_BELOW_0.35%"
+
+        # Sniper Mode Pre-Checks: Never wake LLM if fundamental entry vetoes are violated
+        bb_pos = features.get("bb_position", 0.5)
+        if bb_pos > 0.75:
+            return False, f"OVERBOUGHT_BB_POSITION_{bb_pos:.2f}_ABOVE_0.75"
+
+        trend_bullish = features.get("trend_bullish", False)
+        if not trend_bullish:
+            return False, "TREND_NOT_BULLISH"
+
+        ema50 = features.get("ema50", 0.0)
+        if ema50 > 0 and last_price < ema50:
+            return False, f"PRICE_BELOW_EMA50_{last_price:,.0f}<{ema50:,.0f}"
+
+        obi = features.get("obi_top5", 0.0)
+        if obi < 0:
+            return False, f"NEGATIVE_OBI_DEPTH_{obi:.2f}"
 
         rsi = features.get("rsi_14", 50.0)
-        obi = features.get("obi_top5", 0.0)
         taker_buy = features.get("taker_buy_ratio", 0.5)
-        trend_bullish = features.get("trend_bullish", False)
         macro_uptrend = features.get("macro_uptrend", False)
         bullish_rebound = features.get("bullish_rebound", False)
         rsi_turning_up = features.get("rsi_turning_up", False)
@@ -250,7 +265,8 @@ class CostEffectiveLLMStrategist:
             )
 
         if not self.client:
-            return self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason), True
+            fb = self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason)
+            return self._apply_sniper_vetoes_if_buy(norm_symbol, fb, features), True
 
         user_payload = {
             "symbol": norm_symbol,
@@ -284,6 +300,7 @@ class CostEffectiveLLMStrategist:
             decision = AIDecisionOutput(**parsed)  # validators clamp confidence / allocation_pct
             decision.decision_source = "LLM"
             decision.llm_latency_ms = round((time.time() - started) * 1000.0, 0)
+            decision = self._apply_sniper_vetoes_if_buy(norm_symbol, decision, features)
 
             if decision.action == "HOLD":
                 self._hold_cooldown_cache[norm_symbol] = (time.time(), features.get("last_price", 0.0))
@@ -294,7 +311,74 @@ class CostEffectiveLLMStrategist:
             logger.warning(f"LLM API Error on {norm_symbol} ({e}) -> Using deterministic quant fallback.")
             fb = self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason)
             fb.llm_latency_ms = round((time.time() - started) * 1000.0, 0)
+            fb = self._apply_sniper_vetoes_if_buy(norm_symbol, fb, features)
             return fb, True
+
+    @staticmethod
+    def check_sniper_vetoes(symbol: str, features: dict) -> Optional[str]:
+        """
+        Sniper Mode Entry Hard Vetoes:
+        1. Trend Alignment Veto: Reject BUY if trend_bullish is False or price < ema50. Never buy counter-trend.
+        2. Overbought Veto: Reject BUY if bb_position > 0.75 (prevent buying tops of Bollinger Bands).
+        3. Microstructure Depth Veto: Reject BUY if obi_top5 < 0 (ensure buy depth actively exceeds sell depth).
+        4. Minimum Volatility Filter: Ensure atr_pct >= 0.35% so bot does not enter dead ranges where fees exceed movement.
+        """
+        trend_bullish = bool(features.get("trend_bullish", False))
+        price = float(features.get("last_price", 0.0) or features.get("best_ask", 0.0))
+        ema50 = float(features.get("ema50", 0.0))
+        bb_pos = float(features.get("bb_position", 0.5))
+        obi = float(features.get("obi_top5", 0.0))
+        atr_pct = float(features.get("atr_pct", 0.0))
+
+        # 1. Trend Alignment Veto
+        if not trend_bullish:
+            return "SNIPER_VETO_COUNTER_TREND (trend_bullish is False)"
+        if ema50 > 0 and price < ema50:
+            return f"SNIPER_VETO_BELOW_EMA50 (price {price:,.0f} < EMA50 {ema50:,.0f})"
+
+        # 2. Overbought Veto
+        if bb_pos > 0.75:
+            return f"SNIPER_VETO_OVERBOUGHT_BB (bb_position {bb_pos:.3f} > 0.75)"
+
+        # 3. Microstructure Depth Veto
+        if obi < 0:
+            return f"SNIPER_VETO_NEGATIVE_OBI (obi_top5 {obi:+.4f} < 0)"
+
+        # 4. Minimum Volatility Filter
+        if atr_pct < 0.35:
+            return f"SNIPER_VETO_LOW_VOLATILITY (atr_pct {atr_pct:.2f}% < 0.35%)"
+
+        return None
+
+    def _apply_sniper_vetoes_if_buy(
+        self, symbol: str, decision: AIDecisionOutput, features: dict
+    ) -> AIDecisionOutput:
+        if decision.action != "BUY":
+            return decision
+
+        veto_reason = self.check_sniper_vetoes(symbol, features)
+        if not veto_reason:
+            return decision
+
+        logger.info(
+            f"[SNIPER VETO] {symbol} BUY converted to safe HOLD by sniper veto: {veto_reason}"
+        )
+        safe_hold = AIDecisionOutput(
+            symbol=symbol,
+            action="HOLD",
+            order_type="LIMIT",
+            confidence=0.5,
+            allocation_pct=0.0,
+            signals_observed=decision.signals_observed + [veto_reason],
+            reasoning_fa=(
+                f"فیلتر تک‌تیرانداز (Sniper Veto): سیگنال خرید به دلیل نقض شروط بنیادین "
+                f"({veto_reason}) وتو شده و به نگهداری امن (HOLD) تبدیل گردید."
+            ),
+            decision_source=decision.decision_source,
+            llm_latency_ms=decision.llm_latency_ms,
+        )
+        self._hold_cooldown_cache[symbol] = (time.time(), features.get("last_price", 0.0))
+        return safe_hold
 
     def _call_llm_with_retry(self, messages: list) -> str:
         """Tries reasoning mode first (with ample token budget), then falls back to standard chat completion."""

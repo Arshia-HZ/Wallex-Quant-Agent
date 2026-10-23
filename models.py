@@ -33,7 +33,7 @@ class AIDecisionOutput(BaseModel):
     action: Literal["BUY", "SELL", "HOLD"]
     order_type: Literal["LIMIT", "MARKET"]
     confidence: float = Field(ge=0.0, le=1.0)
-    allocation_pct: float = Field(ge=0.0, le=0.25)
+    allocation_pct: float = Field(ge=0.0, le=0.40)
     limit_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
     take_profit_price: Optional[float] = None
@@ -51,7 +51,7 @@ class AIDecisionOutput(BaseModel):
     @field_validator("allocation_pct", mode="before")
     @classmethod
     def _clamp_allocation(cls, v):
-        return _clamp(v, 0.0, 0.25)
+        return _clamp(v, 0.0, 0.40)
 
 
 class PositionState(BaseModel):
@@ -98,5 +98,6 @@ class PortfolioState(BaseModel):
     positions: Dict[str, PositionState] = Field(default_factory=dict)
     open_orders: List[OpenOrderRecord] = Field(default_factory=list)
     pending_buy_orders: Dict[str, Any] = Field(default_factory=dict)
+    pending_sell_orders: Dict[str, Any] = Field(default_factory=dict)
     last_updated: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: Optional[str] = None

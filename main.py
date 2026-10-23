@@ -416,6 +416,18 @@ def _age_sec(iso_ts: Optional[str]) -> float:
         return 0.0
 
 
+def _positive_float(val: object, fallback: float = 0.0) -> float:
+    """Safely extracts a strictly positive float. Rejects string '0', negative numbers, NaN, and None."""
+    if val is not None:
+        try:
+            f = float(val)
+            if f > 0.0 and not math.isnan(f):
+                return f
+        except (ValueError, TypeError):
+            pass
+    return fallback
+
+
 class PortfolioAndRiskManager:
     def __init__(self, config: AgentConfig):
         self.config = config
@@ -430,6 +442,7 @@ class PortfolioAndRiskManager:
         self.losing_trades_count: int = 0
         self.positions: Dict[str, OpenPosition] = {}
         self.pending_buy_orders: Dict[str, dict] = {}
+        self.pending_sell_orders: Dict[str, dict] = {}
         self.last_exit_ts: Dict[str, float] = {}
         self.consecutive_losses: int = 0
         self.entries_paused_until_ts: float = 0.0
@@ -453,6 +466,7 @@ class PortfolioAndRiskManager:
             "losing_trades_count": self.losing_trades_count,
             "positions": {sym: asdict(pos) for sym, pos in self.positions.items()},
             "pending_buy_orders": self.pending_buy_orders,
+            "pending_sell_orders": self.pending_sell_orders,
             "last_exit_ts": self.last_exit_ts,
             "consecutive_losses": self.consecutive_losses,
             "entries_paused_until_ts": self.entries_paused_until_ts,
@@ -497,6 +511,7 @@ class PortfolioAndRiskManager:
             self.winning_trades_count = int(data.get("winning_trades_count", 0))
             self.losing_trades_count = int(data.get("losing_trades_count", 0))
             self.pending_buy_orders = data.get("pending_buy_orders") or {}
+            self.pending_sell_orders = data.get("pending_sell_orders") or {}
             self.last_exit_ts = {k: float(v) for k, v in (data.get("last_exit_ts") or {}).items()}
             self.consecutive_losses = int(data.get("consecutive_losses", 0))
             self.entries_paused_until_ts = float(data.get("entries_paused_until_ts", 0.0))
@@ -545,7 +560,10 @@ class PortfolioAndRiskManager:
                     crypto_val += qty * px
 
                 if pos:
-                    if free_qty >= min_qty:
+                    if sym in self.pending_sell_orders:
+                        # Assets may be locked on an active sell order; retain position until confirmed
+                        pass
+                    elif free_qty >= min_qty:
                         # Sync tracked quantity with actual post-fee wallet balance
                         pos.quantity = free_qty
                     elif qty < min_qty and _age_sec(pos.opened_at) > 120 and sym not in self.pending_buy_orders:
@@ -555,7 +573,12 @@ class PortfolioAndRiskManager:
                         )
                         self.positions.pop(sym, None)
                         changed = True
-                elif px > 0 and qty * px >= self.config.exchange_min_notional_tmn and sym not in self.pending_buy_orders:
+                elif (
+                    px > 0
+                    and qty * px >= self.config.exchange_min_notional_tmn
+                    and sym not in self.pending_buy_orders
+                    and sym not in self.pending_sell_orders
+                ):
                     if sym not in self._orphan_warned:
                         self._orphan_warned.add(sym)
                         logger.warning(
@@ -604,6 +627,21 @@ class PortfolioAndRiskManager:
                 self.save_state()
 
         if current_bid <= pos.stop_loss_price:
+            spread_pct = float(features.get("spread_pct", 0.0))
+            mid_price = float(features.get("mid_price", current_bid))
+            max_sl_spread = getattr(self.config, "stop_loss_max_spread_pct", 0.80)
+
+            # Stop-loss spread guard & liquidity hole protection:
+            # If spread is abnormally wide (> 0.80%), an order book liquidity hole exists.
+            # Do NOT dump immediately into the vacuum unless mid_price has actually breached SL.
+            if spread_pct > max_sl_spread and mid_price > pos.stop_loss_price:
+                logger.warning(
+                    f"[SPREAD GUARD ACTIVE] {symbol} best_bid ({current_bid:,.0f}) <= SL ({pos.stop_loss_price:,.0f}), "
+                    f"but spread is wide ({spread_pct:.2f}% > {max_sl_spread:.2f}%) and mid_price ({mid_price:,.0f}) > SL. "
+                    f"Liquidity hole detected; holding position to avoid dumping into vacuum."
+                )
+                return None
+
             exit_type = "TRAILING_STOP_PROFIT_LOCK" if pos.trailing_active else "HARD_STOP_LOSS"
             return AIDecisionOutput(
                 symbol=symbol,
@@ -611,10 +649,11 @@ class PortfolioAndRiskManager:
                 order_type="MARKET",
                 confidence=1.0,
                 allocation_pct=0.0,
-                signals_observed=[exit_type, f"PNL_{pnl_pct*100:.2f}%"],
+                signals_observed=[exit_type, f"PNL_{pnl_pct*100:.2f}%", f"SPREAD_{spread_pct:.2f}%"],
                 reasoning_fa=(
                     f"خروج خودکار مدیریت ریسک ({exit_type}): قیمت فعلی ({current_bid:,.0f}) به سطح توقف "
-                    f"({pos.stop_loss_price:,.0f}) رسید. بازدهی ناخالص پوزیشن: {pnl_pct*100:.2f}%."
+                    f"({pos.stop_loss_price:,.0f}) رسید (اسپرد {spread_pct:.2f}٪ تأیید شد). "
+                    f"بازدهی ناخالص پوزیشن: {pnl_pct*100:.2f}%."
                 ),
                 decision_source="RISK_ENGINE",
             )
@@ -682,6 +721,55 @@ class PortfolioAndRiskManager:
         else:
             self.consecutive_losses = 0
 
+    def calculate_position_size_tmn(
+        self, decision: AIDecisionOutput, features: dict, avail_tmn: float, total_eq: float
+    ) -> float:
+        """
+        Dynamic Kelly / Confidence-Based Sizing (Solves Idle Capital):
+        - High conviction (confidence >= 0.80 with positive trend and positive OBI): 35% - 40% of capital.
+        - Moderate conviction (0.65 <= confidence < 0.80): 15% - 20% of capital.
+        - Strictly maintains 20% liquid cash reserve floor and 100,000 TMN exchange minimum notional floor.
+        """
+        min_reserve = total_eq * self.config.min_cash_reserve_pct
+        spendable = max(0.0, avail_tmn - min_reserve)
+        if spendable < self.config.exchange_min_notional_tmn:
+            return 0.0
+
+        confidence = decision.confidence
+        trend_bullish = bool(features.get("trend_bullish", False))
+        obi = float(features.get("obi_top5", 0.0))
+
+        high_base = getattr(self.config, "high_conviction_position_pct", 0.35)
+        max_pos = getattr(self.config, "max_position_pct", 0.40)
+
+        # Dynamic Kelly-inspired conviction scaling:
+        if confidence >= 0.80 and trend_bullish and obi > 0:
+            # High-conviction signal: scale between high_conviction_position_pct (35%) and max_position_pct (40%)
+            conf_scale = min(1.0, max(0.0, (confidence - 0.80) / 0.20))
+            alloc_pct = high_base + (conf_scale * (max_pos - high_base))
+        elif confidence >= 0.80:
+            alloc_pct = min(0.25, max_pos)
+        elif confidence >= 0.65:
+            # Moderate conviction: scale between 15% and 20%
+            conf_scale = min(1.0, max(0.0, (confidence - 0.65) / 0.15))
+            alloc_pct = 0.15 + (conf_scale * 0.05)  # 15% to 20%
+        else:
+            return 0.0
+
+        # Model requested allocation can scale up within limits, bounded by max_position_pct
+        if decision.allocation_pct and decision.allocation_pct > 0:
+            alloc_pct = max(alloc_pct, decision.allocation_pct)
+        alloc_pct = min(alloc_pct, self.config.max_position_pct)
+
+        target_tmn = total_eq * alloc_pct
+        order_tmn = min(target_tmn, spendable)
+
+        # Enforce exchange minimum notional floor (100,000 TMN)
+        if order_tmn < self.config.exchange_min_notional_tmn:
+            return 0.0
+
+        return order_tmn
+
     def approve_and_size_buy(
         self, decision: AIDecisionOutput, features: dict, avail_tmn: float, total_eq: float
     ) -> tuple[bool, str, float]:
@@ -693,26 +781,36 @@ class PortfolioAndRiskManager:
         if blocked:
             return False, blocked, 0.0
 
-        total_open_count = len(self.positions) + len(self.pending_buy_orders)
+        total_open_count = len(self.positions) + len(self.pending_buy_orders) + len(self.pending_sell_orders)
         if total_open_count >= self.config.max_concurrent_positions:
             return False, "MAX_CONCURRENT_POSITIONS_REACHED", 0.0
 
-        if decision.symbol in self.positions or decision.symbol in self.pending_buy_orders:
+        if (
+            decision.symbol in self.positions
+            or decision.symbol in self.pending_buy_orders
+            or decision.symbol in self.pending_sell_orders
+        ):
             return False, "ALREADY_IN_POSITION_OR_PENDING", 0.0
 
         if decision.confidence < 0.65:
             return False, f"LOW_CONFIDENCE_{decision.confidence}", 0.0
 
-        if features["spread_pct"] > self.config.max_spread_pct:
-            return False, f"WIDE_SPREAD_{features['spread_pct']}%", 0.0
+        if features.get("spread_pct", 0.0) > self.config.max_spread_pct:
+            return False, f"WIDE_SPREAD_{features.get('spread_pct')}%", 0.0
 
-        min_reserve = total_eq * self.config.min_cash_reserve_pct
-        spendable = max(0.0, avail_tmn - min_reserve)
-        alloc_pct = min(decision.allocation_pct or self.config.max_position_pct, self.config.max_position_pct)
-        order_tmn = min(total_eq * alloc_pct, spendable)
+        veto_reason = CostEffectiveLLMStrategist.check_sniper_vetoes(decision.symbol, features)
+        if veto_reason:
+            return False, f"REJECTED_BY_SNIPER_VETO: {veto_reason}", 0.0
 
-        if order_tmn < self.config.min_order_tmn:
-            return False, f"INSUFFICIENT_SPENDABLE_TMN ({order_tmn:,.0f} < {self.config.min_order_tmn:,.0f})", 0.0
+        order_tmn = self.calculate_position_size_tmn(decision, features, avail_tmn, total_eq)
+        if order_tmn < self.config.exchange_min_notional_tmn:
+            min_reserve = total_eq * self.config.min_cash_reserve_pct
+            spendable = max(0.0, avail_tmn - min_reserve)
+            return (
+                False,
+                f"INSUFFICIENT_SPENDABLE_TMN (spendable {spendable:,.0f} < floor {self.config.exchange_min_notional_tmn:,.0f})",
+                0.0,
+            )
 
         return True, "APPROVED_BY_RISK_GUARD", order_tmn
 
@@ -777,7 +875,11 @@ class TradingAgentRunner:
         now = time.time()
 
         if self.config.mode == ExecutionMode.LIVE:
-            if not self.risk_mgr.pending_buy_orders and not self.pending_order_timestamps:
+            if (
+                not self.risk_mgr.pending_buy_orders
+                and not self.risk_mgr.pending_sell_orders
+                and not self.pending_order_timestamps
+            ):
                 return
             open_orders = self.client.get_open_orders()
             if open_orders is None:
@@ -794,13 +896,14 @@ class TradingAgentRunner:
                 if now - first_seen >= self.config.stale_order_timeout_sec:
                     logger.warning(f"[STALE ORDER] Canceling stale order {cid} on {o.get('symbol')}")
                     self.client.cancel_order(cid)
+                    live_cids.discard(cid)
                     self.pending_order_timestamps.pop(cid, None)
                     for sym in list(self.risk_mgr.pending_buy_orders.keys()):
                         if self.risk_mgr.pending_buy_orders[sym].get("client_id") == cid:
                             del self.risk_mgr.pending_buy_orders[sym]
                             self.risk_mgr.save_state()
 
-            # Verify pending orders that left open_orders using actual wallet balance
+            # Verify pending buy orders that left open_orders using actual wallet balance
             for sym, pending in list(self.risk_mgr.pending_buy_orders.items()):
                 cid = pending.get("client_id")
                 if cid and cid not in live_cids:
@@ -808,6 +911,7 @@ class TradingAgentRunner:
                     min_qty = self.client.market_rules.get(sym, {}).get("min_qty", 0.00001)
                     if free_qty >= min_qty:
                         logger.info(f"[LIMIT FILLED] Verified wallet balance {free_qty} for {sym}. Promoting to position.")
+                        actual_cost = free_qty * pending["entry_price"] * (1.0 + self.config.maker_fee_rate)
                         self.risk_mgr.positions[sym] = OpenPosition(
                             symbol=sym,
                             entry_price=pending["entry_price"],
@@ -817,7 +921,7 @@ class TradingAgentRunner:
                             highest_price=pending["entry_price"],
                             opened_at=datetime.now(timezone.utc).isoformat(),
                             client_id=cid,
-                            cost_tmn=pending.get("order_tmn", 0.0),
+                            cost_tmn=actual_cost,
                             entry_fee_rate=self.config.maker_fee_rate,
                         )
                     else:
@@ -828,6 +932,102 @@ class TradingAgentRunner:
                         )
                     self.pending_order_timestamps.pop(cid, None)
                     del self.risk_mgr.pending_buy_orders[sym]
+                    self.risk_mgr.save_state()
+
+            # Verify pending sell orders that left open_orders
+            for sym, pending_sell in list(self.risk_mgr.pending_sell_orders.items()):
+                cid = pending_sell.get("client_id")
+                if cid and cid not in live_cids:
+                    order_info = self.client.get_order_by_client_id(cid)
+                    order_status = str(order_info.get("status", "")).upper() if order_info else ""
+                    wallet_free = self.client.get_free_asset_balance(sym)
+                    min_qty = self.client.market_rules.get(sym, {}).get("min_qty", 0.00001)
+
+                    sell_qty = pending_sell["sell_qty"]
+                    executed_qty = _positive_float(order_info.get("executedQty") if order_info else None, 0.0)
+                    pos = self.risk_mgr.positions.get(sym)
+
+                    # Case 1: Order fully filled (or remaining wallet coins below dust limit)
+                    if order_status == "FILLED" or wallet_free < min_qty or (executed_qty >= sell_qty * 0.999 and executed_qty > 0):
+                        fill_price = self._best_fill_price(order_info, pending_sell["exec_price"])
+                        cost_part = pending_sell["cost_part"]
+                        fallback_proceeds = sell_qty * fill_price
+                        gross_proceeds = _positive_float(
+                            order_info.get("executedSum") if order_info else None, fallback_proceeds
+                        )
+                        exit_fee = gross_proceeds * self.config.taker_fee_rate
+                        net_pnl_tmn = (gross_proceeds - exit_fee) - cost_part
+                        net_pnl_pct = (net_pnl_tmn / max(cost_part, 1.0)) * 100.0
+
+                        self.risk_mgr.realized_pnl_tmn += net_pnl_tmn
+                        self.risk_mgr.total_trades_count += 1
+                        if net_pnl_tmn > 0:
+                            self.risk_mgr.winning_trades_count += 1
+                        else:
+                            self.risk_mgr.losing_trades_count += 1
+
+                        popped_pos = self.risk_mgr.positions.pop(sym, None)
+                        exit_reason = pending_sell.get("exit_reason", "MARKET_SELL")
+                        if exit_reason != "END_OF_CONTEST_LIQUIDATION":
+                            self.risk_mgr.register_exit(sym, net_pnl_tmn)
+
+                        trade_meta = {
+                            "entry_price": popped_pos.entry_price if popped_pos else (pos.entry_price if pos else 0.0),
+                            "exit_price": fill_price,
+                            "sold_quantity": sell_qty,
+                            "realized_net_pnl_tmn": round(net_pnl_tmn, 0),
+                            "realized_net_pnl_pct": round(net_pnl_pct, 3),
+                            "cumulative_trades": self.risk_mgr.total_trades_count,
+                            "win_rate_pct": round(
+                                (self.risk_mgr.winning_trades_count / max(1, self.risk_mgr.total_trades_count)) * 100.0, 1
+                            ),
+                        }
+                        raw_dec = pending_sell.get("decision")
+                        decision_obj = AIDecisionOutput(**raw_dec) if isinstance(raw_dec, dict) else raw_dec
+                        self.risk_mgr.log_decision(
+                            sym, pending_sell.get("feats", {}), decision_obj, exit_reason, order_info, pending_sell.get("total_eq", 0.0), trade_meta
+                        )
+                        logger.info(
+                            f"[SELL CONFIRMED FILLED] {sym} @ {fill_price:,.0f} TMN | Net PnL: {net_pnl_tmn:+,.0f} TMN "
+                            f"({net_pnl_pct:+.2f}%) | Reason: {exit_reason}"
+                        )
+                    # Case 2: Partial fill before cancel
+                    elif executed_qty > 0 and pos is not None:
+                        fill_price = self._best_fill_price(order_info, pending_sell["exec_price"])
+                        part_frac = min(1.0, executed_qty / max(pos.quantity, executed_qty))
+                        cost_part = pos.cost_tmn * part_frac
+                        fallback_proceeds = executed_qty * fill_price
+                        gross_proceeds = _positive_float(
+                            order_info.get("executedSum") if order_info else None, fallback_proceeds
+                        )
+                        exit_fee = gross_proceeds * self.config.taker_fee_rate
+                        net_pnl_tmn = (gross_proceeds - exit_fee) - cost_part
+                        net_pnl_pct = (net_pnl_tmn / max(cost_part, 1.0)) * 100.0
+
+                        self.risk_mgr.realized_pnl_tmn += net_pnl_tmn
+                        self.risk_mgr.total_trades_count += 1
+                        if net_pnl_tmn > 0:
+                            self.risk_mgr.winning_trades_count += 1
+                        else:
+                            self.risk_mgr.losing_trades_count += 1
+
+                        pos.quantity = max(0.0, pos.quantity - executed_qty)
+                        pos.cost_tmn = max(0.0, pos.cost_tmn - cost_part)
+                        exit_reason = pending_sell.get("exit_reason", "PARTIAL_MARKET_SELL")
+
+                        logger.info(
+                            f"[SELL PARTIALLY FILLED] {sym} sold {executed_qty} of {sell_qty} @ {fill_price:,.0f} TMN | "
+                            f"Net PnL: {net_pnl_tmn:+,.0f} TMN ({net_pnl_pct:+.2f}%) | Remaining Qty: {pos.quantity}"
+                        )
+                    # Case 3: Cancelled with zero fill
+                    else:
+                        logger.warning(
+                            f"[SELL UNCONFIRMED/CANCELLED] Order {cid} on {sym} status: {order_status}. "
+                            f"Wallet free: {wallet_free}. Re-enabling position tracking."
+                        )
+
+                    self.pending_order_timestamps.pop(cid, None)
+                    del self.risk_mgr.pending_sell_orders[sym]
                     self.risk_mgr.save_state()
 
         else:
@@ -854,10 +1054,12 @@ class TradingAgentRunner:
                 if cid:
                     self.client.cancel_order(cid)
             self.risk_mgr.pending_buy_orders.clear()
+            self.risk_mgr.pending_sell_orders.clear()
         else:
             for sym, p in list(self.risk_mgr.pending_buy_orders.items()):
                 self.risk_mgr.shadow_available_tmn += p.get("order_tmn", 0.0)
                 del self.risk_mgr.pending_buy_orders[sym]
+            self.risk_mgr.pending_sell_orders.clear()
             self.risk_mgr.save_state()
 
         for sym, pos in list(self.risk_mgr.positions.items()):
@@ -954,6 +1156,8 @@ class TradingAgentRunner:
         if not self.risk_mgr.positions:
             return
         for sym, pos in list(self.risk_mgr.positions.items()):
+            if sym in self.risk_mgr.pending_sell_orders:
+                continue
             try:
                 ob = self.client.get_orderbook(sym)
                 bids, asks = ob.get("bid", []), ob.get("ask", [])
@@ -961,10 +1165,34 @@ class TradingAgentRunner:
                     continue
                 best_bid = float(bids[0]["price"])
                 best_ask = float(asks[0]["price"])
+                if best_bid <= 0 or best_ask <= 0:
+                    continue
             except Exception as e:
                 logger.warning(f"Fast position check failed for {sym}: {e}")
                 continue
-            feats = {"best_bid": best_bid, "best_ask": best_ask, "last_price": best_bid, "light_snapshot": True}
+
+            mid_price = (best_bid + best_ask) / 2.0
+            spread_pct = ((best_ask - best_bid) / (mid_price + 1e-9)) * 100.0
+
+            # Stop-Loss Spread Guard & Liquidity Hole Protection:
+            # If spread is abnormally wide (> 0.80%), do NOT dump into the vacuum unless mid_price also breached SL.
+            if best_bid <= pos.stop_loss_price and spread_pct > self.config.stop_loss_max_spread_pct:
+                if mid_price > pos.stop_loss_price:
+                    logger.warning(
+                        f"[SPREAD GUARD ACTIVE] {sym} best_bid ({best_bid:,.0f}) <= SL ({pos.stop_loss_price:,.0f}), "
+                        f"but spread is abnormally wide ({spread_pct:.2f}% > {self.config.stop_loss_max_spread_pct:.2f}%) "
+                        f"and mid_price ({mid_price:,.0f}) > SL. Holding to prevent dumping into liquidity hole."
+                    )
+                    continue
+
+            feats = {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "mid_price": round(mid_price, 2),
+                "spread_pct": round(spread_pct, 4),
+                "last_price": round(mid_price, 2),
+                "light_snapshot": True,
+            }
             det_exit = self.risk_mgr.check_deterministic_exits(sym, feats)
             if det_exit is not None:
                 self._execute_sell(sym, pos, feats, det_exit, "DETERMINISTIC_RISK_EXIT", self.last_total_eq)
@@ -1035,7 +1263,7 @@ class TradingAgentRunner:
         logger.info(
             f"Cycle Portfolio | Mode: {self.config.mode.value} | Equity: {total_eq:,.0f} TMN "
             f"({net_return_pct:+.2f}%) | Cash: {avail_tmn:,.0f} TMN | Open Pos: {len(self.risk_mgr.positions)} "
-            f"| Pending Orders: {len(self.risk_mgr.pending_buy_orders)} | Regime: {regime_reason} "
+            f"| Pending: Buy={len(self.risk_mgr.pending_buy_orders)}, Sell={len(self.risk_mgr.pending_sell_orders)} | Regime: {regime_reason} "
             f"| Data ok: {len(market_snapshots)}/{len(active_markets)}"
         )
 
@@ -1050,6 +1278,7 @@ class TradingAgentRunner:
                 if feats["best_ask"] <= pending["limit_price"]:
                     fill_price = min(pending["limit_price"], feats["best_ask"])
                     logger.info(f"[SHADOW LIMIT FILLED] {sym} filled @ {fill_price:,.0f} TMN")
+                    actual_cost = pending["quantity"] * fill_price * (1.0 + self.config.maker_fee_rate)
                     self.risk_mgr.positions[sym] = OpenPosition(
                         symbol=sym,
                         entry_price=fill_price,
@@ -1059,7 +1288,7 @@ class TradingAgentRunner:
                         highest_price=fill_price,
                         opened_at=datetime.now(timezone.utc).isoformat(),
                         client_id=pending["client_id"],
-                        cost_tmn=pending.get("order_tmn", 0.0),
+                        cost_tmn=actual_cost,
                         entry_fee_rate=self.config.maker_fee_rate,
                     )
                     del self.risk_mgr.pending_buy_orders[sym]
@@ -1069,19 +1298,25 @@ class TradingAgentRunner:
 
             # 2. Deterministic exits again on the full snapshot (SL / Trailing / TP / Time-stop)
             if pos is not None:
+                if sym in self.risk_mgr.pending_sell_orders:
+                    continue
                 det_exit = self.risk_mgr.check_deterministic_exits(sym, feats)
                 if det_exit is not None:
                     self._execute_sell(sym, pos, feats, det_exit, "DETERMINISTIC_RISK_EXIT", total_eq)
                     continue
 
             # 3. Capacity / regime / cooldown filters: don't waste LLM calls on entries we'd reject anyway
-            total_open_count = len(self.risk_mgr.positions) + len(self.risk_mgr.pending_buy_orders)
+            total_open_count = (
+                len(self.risk_mgr.positions)
+                + len(self.risk_mgr.pending_buy_orders)
+                + len(self.risk_mgr.pending_sell_orders)
+            )
             if pos is None:
                 if total_open_count >= self.config.max_concurrent_positions:
                     continue
                 min_reserve = total_eq * self.config.min_cash_reserve_pct
                 spendable = max(0.0, avail_tmn - min_reserve)
-                if spendable < self.config.min_order_tmn:
+                if spendable < self.config.exchange_min_notional_tmn:
                     continue
                 if not regime_ok:
                     continue
@@ -1105,7 +1340,12 @@ class TradingAgentRunner:
 
             decision, llm_invoked = self.strategist.evaluate_market(sym, feats, portfolio_context, recent_flow)
 
-            if decision.action == "BUY" and pos is None and sym not in self.risk_mgr.pending_buy_orders:
+            if (
+                decision.action == "BUY"
+                and pos is None
+                and sym not in self.risk_mgr.pending_buy_orders
+                and sym not in self.risk_mgr.pending_sell_orders
+            ):
                 approved, reason, order_tmn = self.risk_mgr.approve_and_size_buy(
                     decision, feats, avail_tmn, total_eq
                 )
@@ -1172,8 +1412,12 @@ class TradingAgentRunner:
             filled_qty = formatted_qty_float
             client_id = res.get("clientOrderId") or res.get("_sent_client_id") or f"wlx_{int(time.time()*1000)}"
 
+            # Exact executed cash tracking from order response (fixes accounting phantom loss)
+            fallback_cost = filled_qty * exec_price * (1.0 + buy_fee_rate)
+            executed_cost_tmn = _positive_float(res.get("executedSum"), fallback_cost)
+
             if self.config.mode == ExecutionMode.SHADOW:
-                self.risk_mgr.shadow_available_tmn -= order_tmn
+                self.risk_mgr.shadow_available_tmn -= executed_cost_tmn
 
             # Market orders or marketable limit orders fill immediately; passive limits wait in pending_buy_orders
             is_immediate_fill = (order_type == "MARKET" or exec_price >= feats["best_ask"])
@@ -1198,6 +1442,13 @@ class TradingAgentRunner:
                         )
                     order_info = self.client.get_order_by_client_id(client_id)
                     entry_price = self._best_fill_price(order_info or res, exec_price)
+                    if order_info:
+                        executed_cost_tmn = _positive_float(
+                            order_info.get("executedSum"),
+                            (actual_qty * entry_price * (1.0 + buy_fee_rate)) if (actual_qty > 0 and entry_price > 0) else executed_cost_tmn,
+                        )
+                    elif actual_qty > 0 and entry_price > 0:
+                        executed_cost_tmn = actual_qty * entry_price * (1.0 + buy_fee_rate)
 
                 self.risk_mgr.positions[sym] = OpenPosition(
                     symbol=sym,
@@ -1208,7 +1459,7 @@ class TradingAgentRunner:
                     highest_price=entry_price,
                     opened_at=datetime.now(timezone.utc).isoformat(),
                     client_id=client_id,
-                    cost_tmn=order_tmn,
+                    cost_tmn=executed_cost_tmn,
                     entry_fee_rate=buy_fee_rate,
                 )
             else:
@@ -1280,45 +1531,77 @@ class TradingAgentRunner:
                 reference_price=exec_price,
             )
 
+            client_id = res.get("clientOrderId") or res.get("_sent_client_id") or f"wlx_sell_{int(time.time()*1000)}"
+            status = str(res.get("status", "")).upper()
+            is_immediate_fill = (self.config.mode == ExecutionMode.SHADOW or status == "FILLED")
+
             frac = min(1.0, sell_qty / pos.quantity) if pos.quantity > 0 else 1.0
             cost_full = pos.cost_tmn if pos.cost_tmn > 0 else pos.quantity * pos.entry_price * (1.0 + pos.entry_fee_rate)
             cost_part = cost_full * frac
-            gross_proceeds = sell_qty * exec_price
+            fallback_proceeds = sell_qty * exec_price
+            gross_proceeds = _positive_float(res.get("executedSum"), fallback_proceeds)
             exit_fee = gross_proceeds * self.config.taker_fee_rate
             net_pnl_tmn = (gross_proceeds - exit_fee) - cost_part
             net_pnl_pct = (net_pnl_tmn / max(cost_part, 1.0)) * 100.0
 
-            if self.config.mode == ExecutionMode.SHADOW:
-                self.risk_mgr.shadow_available_tmn += (gross_proceeds - exit_fee)
+            if is_immediate_fill:
+                if self.config.mode == ExecutionMode.SHADOW:
+                    self.risk_mgr.shadow_available_tmn += (gross_proceeds - exit_fee)
 
-            self.risk_mgr.realized_pnl_tmn += net_pnl_tmn
-            self.risk_mgr.total_trades_count += 1
-            if net_pnl_tmn > 0:
-                self.risk_mgr.winning_trades_count += 1
+                self.risk_mgr.realized_pnl_tmn += net_pnl_tmn
+                self.risk_mgr.total_trades_count += 1
+                if net_pnl_tmn > 0:
+                    self.risk_mgr.winning_trades_count += 1
+                else:
+                    self.risk_mgr.losing_trades_count += 1
+
+                self.risk_mgr.positions.pop(sym, None)
+                if exit_reason != "END_OF_CONTEST_LIQUIDATION":
+                    self.risk_mgr.register_exit(sym, net_pnl_tmn)
+                self.risk_mgr.save_state()
+
+                trade_meta = {
+                    "entry_price": pos.entry_price,
+                    "exit_price": exec_price,
+                    "sold_quantity": sell_qty,
+                    "realized_net_pnl_tmn": round(net_pnl_tmn, 0),
+                    "realized_net_pnl_pct": round(net_pnl_pct, 3),
+                    "cumulative_trades": self.risk_mgr.total_trades_count,
+                    "win_rate_pct": round(
+                        (self.risk_mgr.winning_trades_count / max(1, self.risk_mgr.total_trades_count)) * 100.0, 1
+                    ),
+                }
+                self.risk_mgr.log_decision(sym, feats, decision, exit_reason, res, total_eq, trade_meta)
+                logger.info(
+                    f"[SELL EXECUTED] {sym} @ {exec_price:,.0f} TMN | Net PnL: {net_pnl_tmn:+,.0f} TMN "
+                    f"({net_pnl_pct:+.2f}%) | Reason: {exit_reason}"
+                )
             else:
-                self.risk_mgr.losing_trades_count += 1
-
-            self.risk_mgr.positions.pop(sym, None)
-            if exit_reason != "END_OF_CONTEST_LIQUIDATION":
-                self.risk_mgr.register_exit(sym, net_pnl_tmn)
-            self.risk_mgr.save_state()
-
-            trade_meta = {
-                "entry_price": pos.entry_price,
-                "exit_price": exec_price,
-                "sold_quantity": sell_qty,
-                "realized_net_pnl_tmn": round(net_pnl_tmn, 0),
-                "realized_net_pnl_pct": round(net_pnl_pct, 3),
-                "cumulative_trades": self.risk_mgr.total_trades_count,
-                "win_rate_pct": round(
-                    (self.risk_mgr.winning_trades_count / max(1, self.risk_mgr.total_trades_count)) * 100.0, 1
-                ),
-            }
-            self.risk_mgr.log_decision(sym, feats, decision, exit_reason, res, total_eq, trade_meta)
-            logger.info(
-                f"[SELL EXECUTED] {sym} @ {exec_price:,.0f} TMN | Net PnL: {net_pnl_tmn:+,.0f} TMN "
-                f"({net_pnl_pct:+.2f}%) | Reason: {exit_reason}"
-            )
+                # Asynchronous sell order tracking:
+                # Wallex spot API executes sells as marketable LIMIT orders at best_bid.
+                # If liquidity is thin, order returns status NEW / PARTIALLY_FILLED.
+                # Do NOT prematurely pop position from positions while order is still active!
+                self.risk_mgr.pending_sell_orders[sym] = {
+                    "client_id": client_id,
+                    "symbol": sym,
+                    "sell_qty": sell_qty,
+                    "exec_price": exec_price,
+                    "cost_part": cost_part,
+                    "cost_full": cost_full,
+                    "frac": frac,
+                    "exit_reason": exit_reason,
+                    "decision": decision.model_dump() if hasattr(decision, "model_dump") else decision,
+                    "feats": feats,
+                    "total_eq": total_eq,
+                    "status": status,
+                    "created_at_ts": time.time(),
+                }
+                self.pending_order_timestamps[client_id] = time.time()
+                self.risk_mgr.save_state()
+                logger.info(
+                    f"[SELL SUBMITTED - PENDING FILL] {sym} | ClientId: {client_id} | Status: {status} | "
+                    f"Qty: {sell_qty} @ {exec_price:,.0f} TMN | Position retained until confirmed FILLED."
+                )
         except Exception as e:
             logger.error(f"Sell execution failed on {sym}: {e}")
 

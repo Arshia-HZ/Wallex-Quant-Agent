@@ -35,7 +35,13 @@ class AgentConfig:
         default_factory=lambda: float(os.getenv("INITIAL_CAPITAL_TMN", "5000000.0"))
     )
     max_position_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.22"))
+        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.40"))
+    )
+    high_conviction_position_pct: float = field(
+        default_factory=lambda: float(os.getenv("HIGH_CONVICTION_POSITION_PCT", "0.35"))
+    )
+    moderate_conviction_position_pct: float = field(
+        default_factory=lambda: float(os.getenv("MODERATE_CONVICTION_POSITION_PCT", "0.18"))
     )
     min_cash_reserve_pct: float = field(
         default_factory=lambda: float(os.getenv("MIN_CASH_RESERVE_PCT", "0.20"))
@@ -47,7 +53,10 @@ class AgentConfig:
         default_factory=lambda: float(os.getenv("EXCHANGE_MIN_NOTIONAL_TMN", "100000.0"))
     )
     min_order_tmn: float = field(
-        default_factory=lambda: float(os.getenv("MIN_ORDER_TMN", "150000.0"))
+        default_factory=lambda: float(os.getenv("MIN_ORDER_TMN", "100000.0"))
+    )
+    stop_loss_max_spread_pct: float = field(
+        default_factory=lambda: float(os.getenv("STOP_LOSS_MAX_SPREAD_PCT", "0.80"))
     )
     # Wallex Credit Account Fee Schedule for TMN base markets: Maker 0.25%, Taker 0.30%
     maker_fee_rate: float = field(
@@ -113,7 +122,7 @@ class AgentConfig:
         default_factory=lambda: os.getenv("CANDLE_RESOLUTION", "15")
     )
     min_atr_pct: float = field(
-        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.22"))
+        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.35"))
     )  # Blocks dead/flat markets that cannot beat 0.55%-0.60% round-trip fee
     max_spread_pct: float = field(
         default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.55"))
