@@ -46,8 +46,10 @@ class WallexClient:
         )
         for sym in allowed_active:
             info = symbols_data.get(sym, {})
-            price_prec = int(info.get("quotePrecision", info.get("quoteAssetPrecision", 0) or 0))
-            qty_prec = int(info.get("baseAssetPrecision", info.get("stepSize", 6) or 6))
+            tick_size = info.get("tickSize")
+            step_size = info.get("stepSize")
+            price_prec = int(tick_size if tick_size is not None else (info.get("quotePrecision", 0) or 0))
+            qty_prec = int(step_size if step_size is not None else (info.get("baseAssetPrecision", 6) or 6))
             min_qty = float(info.get("minQty", 0.00000001))
             # Enforce at least 100,000 TMN even if the API metadata reports 50,000 TMN
             api_min_notional = float(info.get("minNotional", 100_000.0) or 100_000.0)

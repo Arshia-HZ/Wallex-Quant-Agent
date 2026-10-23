@@ -108,8 +108,10 @@ class WallexClient:
         self.market_rules = {}
         for sym in allowed_active:
             info = symbols_data.get(sym, {})
-            price_prec = int(info.get("quotePrecision", info.get("quoteAssetPrecision", 0) or 0))
-            qty_prec = int(info.get("baseAssetPrecision", info.get("stepSize", 6) or 6))
+            tick_size = info.get("tickSize")
+            step_size = info.get("stepSize")
+            price_prec = int(tick_size if tick_size is not None else (info.get("quotePrecision", 0) or 0))
+            qty_prec = int(step_size if step_size is not None else (info.get("baseAssetPrecision", 6) or 6))
             min_qty = float(info.get("minQty", 0.00000001))
             # Enforce at least 100,000 TMN even if the API metadata reports 50,000 TMN
             api_min_notional = float(info.get("minNotional", 100_000.0) or 100_000.0)
@@ -326,26 +328,39 @@ class WallexClient:
 
         # Determine effective price to validate the 100,000 TMN minimum notional requirement
         check_price = price or reference_price
-        if check_price is not None:
-            notional_tmn = final_qty_float * float(check_price)
-            if notional_tmn < min_notional:
-                raise ValueError(
-                    f"LOW_AMOUNT_GUARD: {norm_symbol} {side} order value after rounding is "
-                    f"{notional_tmn:,.0f} TMN, which is below Wallex's {min_notional:,.0f} TMN minimum!"
-                )
+        if check_price is None:
+            ob = self.get_orderbook(norm_symbol)
+            if side.upper() == "BUY" and ob.get("ask"):
+                check_price = float(ob["ask"][0]["price"])
+            elif side.upper() == "SELL" and ob.get("bid"):
+                check_price = float(ob["bid"][0]["price"])
+            else:
+                raise ValueError(f"Price or reference_price is required for {order_type} {side} on {norm_symbol}")
+
+        notional_tmn = final_qty_float * float(check_price)
+        if notional_tmn < min_notional:
+            raise ValueError(
+                f"LOW_AMOUNT_GUARD: {norm_symbol} {side} order value after rounding is "
+                f"{notional_tmn:,.0f} TMN, which is below Wallex's {min_notional:,.0f} TMN minimum!"
+            )
 
         client_id = f"wlx_{int(time.time()*1000)}_{uuid.uuid4().hex[:5]}"
+        formatted_price = self.format_price(norm_symbol, check_price)
+
+        # NOTE: Wallex Spot API does NOT support native MARKET orders
+        # (rejects with 422: "امکان ثبت سفارش قیمت بازار در سکو وجود ندارد.").
+        # All spot orders must be sent as type="LIMIT".
+        # Aggressive/Market orders are placed as Marketable LIMIT orders:
+        # - BUY at best_ask (crosses spread, fills immediately as taker)
+        # - SELL at best_bid (crosses spread, fills immediately as taker)
         payload = {
             "symbol": norm_symbol,
-            "type": order_type.upper(),
+            "type": "LIMIT",
             "side": side.upper(),
             "quantity": formatted_qty,
+            "price": formatted_price,
             "client_id": client_id,
         }
-        if order_type.upper() == "LIMIT":
-            if price is None:
-                raise ValueError("Price is required for LIMIT order")
-            payload["price"] = self.format_price(norm_symbol, price)
 
         if self.config.mode == ExecutionMode.SHADOW:
             return {
@@ -355,12 +370,18 @@ class WallexClient:
                 "side": side.upper(),
                 "type": order_type.upper(),
                 "origQty": formatted_qty,
-                "price": payload.get("price", str(check_price or 0.0)),
+                "price": formatted_price,
             }
 
         resp = self.session.post(
             f"{self.config.base_url}/v1/account/orders", json=payload, timeout=12
         )
+        if resp.status_code >= 400:
+            try:
+                err_body = json.dumps(resp.json(), ensure_ascii=False)
+            except Exception:
+                err_body = resp.text
+            logger.error(f"Wallex order placement failed ({resp.status_code}) on {norm_symbol}: {err_body}")
         resp.raise_for_status()
         result = resp.json().get("result", {})
         if not isinstance(result, dict):
@@ -1366,7 +1387,7 @@ def run_smoke_test(client: WallexClient, symbol: str):
     print(f"[1] BEFORE  TMN={tmn0:,.0f}  {base}={coin0}")
 
     res = client.place_spot_order(sym, "BUY", "MARKET", qty, reference_price=ask)
-    print(f"[2] BUY raw response: {json.dumps(res, ensure_ascii=False, default=str)}")
+    print(f"[2] BUY raw response: {json.dumps(res, ensure_ascii=True, default=str)}")
     time.sleep(2.0)
 
     bal1 = client.get_balances()
@@ -1389,7 +1410,7 @@ def run_smoke_test(client: WallexClient, symbol: str):
     ob2 = client.get_orderbook(sym)
     bid = float(ob2["bid"][0]["price"])
     sell_res = client.place_spot_order(sym, "SELL", "MARKET", got, reference_price=bid)
-    print(f"[5] SELL raw response: {json.dumps(sell_res, ensure_ascii=False, default=str)}")
+    print(f"[5] SELL raw response: {json.dumps(sell_res, ensure_ascii=True, default=str)}")
     time.sleep(2.0)
     bal2 = client.get_balances()
     tmn2 = float(bal2.get("TMN", {}).get("value", 0) or 0)
