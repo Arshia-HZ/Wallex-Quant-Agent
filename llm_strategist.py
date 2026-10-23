@@ -3,6 +3,9 @@
 Cost-Effective LLM Strategist with Quant Gatekeeper & Cooldown Cache.
 Fixes reasoning_effort token starvation, strips markdown fences, filters out dead/flat markets,
 and logs structured JSON trading decisions with Persian audit reasoning for hackathon judges.
+
+Audit honesty: every decision carries `decision_source` ("LLM" | "QUANT_FALLBACK" | "QUANT_GATE")
+and the LLM latency, so judges can see exactly which decisions the language model produced.
 """
 
 import os
@@ -10,7 +13,7 @@ import re
 import time
 import json
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from openai import OpenAI
 from models import AIDecisionOutput
 from config import AgentConfig
@@ -19,7 +22,9 @@ from market_compliance import MarketComplianceGuard
 logger = logging.getLogger("WallexAgent")
 
 COMPACT_SYSTEM_PROMPT = """You are an institutional Algorithmic Spot Trading Agent in the Wallex Hackathon (5,000,000 TMN capital).
-Your mission: Maximize realized TMN return over the 36-hour contest while keeping Maximum Drawdown strictly under 3.0%.
+Your mission: Maximize realized TMN return until the contest deadline while keeping Maximum Drawdown strictly under 3.0%.
+The quant gatekeeper has ALREADY found a candidate setup; you are the final independent judge and VETO layer.
+Return HOLD unless you independently agree the trade has positive expectancy after ~0.55%-0.60% round-trip fees.
 You must output ONLY valid JSON matching this schema:
 {
   "symbol": "string",
@@ -40,13 +45,53 @@ DECISION LOGIC & CONTEST RULES:
    - Setup A (Trend Pullback): macro_uptrend is true, trend_bullish is true (EMA9 > EMA21), RSI_14 between 38 and 62, and (obi_top5 >= +0.08 or taker_buy_ratio >= 0.52).
    - Setup B (Orderbook Buyer Absorption): strong buyer depth (obi_top5 >= +0.25) and aggressive buying (taker_buy_ratio >= 0.58) with positive momentum.
    - Setup C (Momentum Breakout): macro_uptrend is true, volume_zscore >= 1.2 or roc_3_pct >= 0.35%, obi_top5 >= +0.10, and RSI_14 < 68.
-3. Order Pricing: Prefer LIMIT order at best_bid (for BUY) to capture Maker fee (0.25%), or MARKET only if volume_zscore > 2.0 and obi_top5 > 0.30.
-4. Risk Bounds: Set stop_loss_price = max(last_price - 1.8 * atr_14, last_price * (1.0 - 0.014)) (capped at -1.4% to protect capital). Set take_profit_price = max(last_price + 2.8 * atr_14, last_price * 1.028) (target at least +2.8% to guarantee >2:1 reward-to-risk over fees).
-5. Active Positions: DO NOT panic-sell at minor losses or intraday noise (0.55% fee friction will bleed equity). Stop-Loss (-1.4%) and Trailing-Stop (+1.5% activation) are handled deterministically. Recommend SELL only if:
+   VETO (return HOLD) if any of these red flags is present: bullish_rebound is false AND rsi_turning_up is false (falling knife), price is far above the upper Bollinger band (bb_position > 1.0), obi_top5 is negative while taker_buy_ratio < 0.5, or the spread is large relative to atr_pct.
+3. Order Pricing: Entries are executed by the risk engine at the best ask (taker) because passive bids suffer adverse selection and save only 0.05% in fees. Set order_type "MARKET" and limit_price null for BUY.
+4. Risk Bounds (enforced by the executor, which clamps anything outside these ranges):
+   - stop_loss_price: between 0.8% and 1.4% below the entry price. Normally max(entry - 1.8 * atr_14, entry * (1 - 0.014)) floored at -0.8%. A tighter stop sits inside normal noise and loses stop distance PLUS fees. Use null to accept the engine default.
+   - take_profit_price: at least +1.8% above entry (and at least 2x the stop distance); the executor ignores values outside +1.2%..+4.0%. Use null to accept the engine default.
+5. Active Positions: DO NOT panic-sell at minor losses or intraday noise (0.55% fee friction will bleed equity). Stop-Loss, Trailing-Stop (+1.2% activation, breakeven lock) and a time stop are handled deterministically. Recommend SELL only if:
    - The position is IN NET PROFIT (unrealized_pnl_pct >= +1.2%) and showing overbought exhaustion (RSI_14 > 72 with weakening buy ratio) to lock in gains before a dip.
    - The position is stagnant (>2 hours) and macro trend broke down (price < EMA50).
-   Otherwise, output action: "HOLD" to allow the trade breathing room to reach the Take-Profit target (+2.8%).
-6. Always write a rich, specific Persian justification in 'reasoning_fa' citing exact indicator values."""
+   Otherwise, output action: "HOLD" to allow the trade breathing room to reach the Take-Profit target.
+6. Always write a rich, specific Persian justification in 'reasoning_fa' citing exact indicator values.
+
+Never ignore the risk limits above: a clean HOLD is always an acceptable answer."""
+
+
+def compute_sl_tp(
+    config: AgentConfig,
+    price: float,
+    atr: float,
+    llm_sl: Optional[float] = None,
+    llm_tp: Optional[float] = None,
+) -> Tuple[float, float]:
+    """
+    Single source of truth for stop-loss / take-profit placement (used by the executor
+    and by the quant fallback).
+
+    Stop distance: 1.8*ATR, clamped to [min_stop_loss_pct, hard_stop_loss_pct].
+    The LLM may choose a different stop only inside that same range.
+    Take-profit distance: max(default_take_profit_pct, 2 x stop distance).
+    The LLM may choose a different target only inside +1.2%..+4.0% and >= 1.5 x stop distance.
+    """
+    min_stop = config.min_stop_loss_pct
+    max_stop = config.hard_stop_loss_pct
+    atr_dist = (1.8 * atr / price) if (price > 0 and atr and atr > 0) else min_stop
+    sl_dist = min(max(atr_dist, min_stop), max_stop)
+
+    if llm_sl and 0 < llm_sl < price:
+        d = (price - llm_sl) / price
+        if min_stop <= d <= max_stop:
+            sl_dist = d
+
+    tp_dist = max(config.default_take_profit_pct, 2.0 * sl_dist)
+    if llm_tp and llm_tp > price:
+        d = (llm_tp - price) / price
+        if 0.012 <= d <= 0.04 and d >= 1.5 * sl_dist:
+            tp_dist = d
+
+    return price * (1.0 - sl_dist), price * (1.0 + tp_dist)
 
 
 class CostEffectiveLLMStrategist:
@@ -72,6 +117,7 @@ class CostEffectiveLLMStrategist:
             logger.warning("No LLM_API_KEY provided. Agent will use deterministic quant fallback mode.")
 
         self.total_llm_calls = 0
+        self.total_llm_failures = 0
         # Tracks last HOLD evaluation per symbol to prevent spamming tokens on the same candle
         self._hold_cooldown_cache: Dict[str, tuple[float, float]] = {}
 
@@ -123,7 +169,7 @@ class CostEffectiveLLMStrategist:
             if (now - last_ts) < self.config.llm_hold_cooldown_sec and price_change_pct < 0.35:
                 return False, "COOLDOWN_RECENT_LLM_HOLD"
 
-        # 3. Microstructure & Volatility-to-Fee Gate
+        # 4. Microstructure & Volatility-to-Fee Gate
         spread = features.get("spread_pct", 1.0)
         if spread > self.config.max_spread_pct:
             return False, f"SPREAD_TOO_WIDE_{spread:.2f}%"
@@ -139,7 +185,6 @@ class CostEffectiveLLMStrategist:
         macro_uptrend = features.get("macro_uptrend", False)
         bullish_rebound = features.get("bullish_rebound", False)
         rsi_turning_up = features.get("rsi_turning_up", False)
-        min_rsi_last3 = features.get("min_rsi_last3", 50.0)
         vol_z = features.get("volume_zscore", 0.0)
         roc_3 = features.get("roc_3_pct", 0.0)
 
@@ -199,6 +244,7 @@ class CostEffectiveLLMStrategist:
                     allocation_pct=0.0,
                     signals_observed=[trigger_reason],
                     reasoning_fa=f"فیلتر دروازه‌بان کمّی: عدم نیاز به فراخوانی مدل زبانی ({trigger_reason}).",
+                    decision_source="QUANT_GATE",
                 ),
                 False,
             )
@@ -225,21 +271,30 @@ class CostEffectiveLLMStrategist:
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
 
+        started = time.time()
         try:
             self.total_llm_calls += 1
             raw_content = self._call_llm_with_retry(messages)
             cleaned_json = self._clean_json_text(raw_content)
             parsed = json.loads(cleaned_json)
             parsed["symbol"] = norm_symbol
-            decision = AIDecisionOutput(**parsed)
+            # Never trust model-provided audit fields
+            parsed.pop("decision_source", None)
+            parsed.pop("llm_latency_ms", None)
+            decision = AIDecisionOutput(**parsed)  # validators clamp confidence / allocation_pct
+            decision.decision_source = "LLM"
+            decision.llm_latency_ms = round((time.time() - started) * 1000.0, 0)
 
             if decision.action == "HOLD":
                 self._hold_cooldown_cache[norm_symbol] = (time.time(), features.get("last_price", 0.0))
             return decision, True
 
         except Exception as e:
+            self.total_llm_failures += 1
             logger.warning(f"LLM API Error on {norm_symbol} ({e}) -> Using deterministic quant fallback.")
-            return self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason), True
+            fb = self._quant_rule_fallback(norm_symbol, features, portfolio_state, trigger_reason)
+            fb.llm_latency_ms = round((time.time() - started) * 1000.0, 0)
+            return fb, True
 
     def _call_llm_with_retry(self, messages: list) -> str:
         """Tries reasoning mode first (with ample token budget), then falls back to standard chat completion."""
@@ -272,10 +327,12 @@ class CostEffectiveLLMStrategist:
     def _quant_rule_fallback(
         self, symbol: str, features: dict, portfolio_state: dict, trigger_reason: str
     ) -> AIDecisionOutput:
+        """Deterministic decision used when the LLM is unavailable. Always labelled QUANT_FALLBACK."""
         has_pos = portfolio_state.get("position_qty", 0.0) > 0
         last_price = features["last_price"]
         atr = features["atr_14"]
         best_bid = features["best_bid"]
+        best_ask = features["best_ask"]
 
         if has_pos:
             unrealized = portfolio_state.get("unrealized_pnl_pct", 0.0)
@@ -283,15 +340,16 @@ class CostEffectiveLLMStrategist:
                 return AIDecisionOutput(
                     symbol=symbol,
                     action="SELL",
-                    order_type="LIMIT",
+                    order_type="MARKET",
                     confidence=0.85,
                     allocation_pct=0.0,
-                    limit_price=best_bid,
+                    limit_price=None,
                     signals_observed=["QUANT_PROFIT_TAKE_EXHAUSTION", f"PNL_{unrealized:+.2f}%"],
                     reasoning_fa=(
-                        f"تحقق سود کمّی: موقعیت با بازدهی مثبت {unrealized:+.2f}% و نشانه اشباع خرید "
-                        f"(RSI={features['rsi_14']:.1f}) در بهترین قیمت خرید ثبت شد."
+                        f"تحقق سود کمّی (جایگزین مدل زبانی): موقعیت با بازدهی مثبت {unrealized:+.2f}% و نشانه اشباع خرید "
+                        f"(RSI={features['rsi_14']:.1f}) در بهترین قیمت خرید فروخته شد."
                     ),
+                    decision_source="QUANT_FALLBACK",
                 )
             return AIDecisionOutput(
                 symbol=symbol,
@@ -301,29 +359,33 @@ class CostEffectiveLLMStrategist:
                 allocation_pct=0.0,
                 signals_observed=["QUANT_POSITION_HOLD"],
                 reasoning_fa="نگهداری پوزیشن باز؛ حد ضرر و تریلینگ استاپ فعال است و فضا برای رشد تا حد سود داده می‌شود.",
+                decision_source="QUANT_FALLBACK",
             )
 
-        sl_price = max(last_price - 1.8 * atr, last_price * (1.0 - self.config.hard_stop_loss_pct))
-        tp_price = max(last_price + 2.8 * atr, last_price * (1.0 + self.config.default_take_profit_pct))
+        entry_ref = best_ask if self.config.force_market_entries else last_price
+        sl_price, tp_price = compute_sl_tp(self.config, entry_ref, atr)
 
         return AIDecisionOutput(
             symbol=symbol,
             action="BUY",
-            order_type="LIMIT",
+            order_type="MARKET",
             confidence=0.76,
             allocation_pct=self.config.max_position_pct,
-            limit_price=best_bid,
-            stop_loss_price=round(sl_price, 2),
-            take_profit_price=round(tp_price, 2),
+            limit_price=None,
+            stop_loss_price=round(sl_price, 6),
+            take_profit_price=round(tp_price, 6),
             signals_observed=[
                 trigger_reason,
                 f"RSI={features['rsi_14']}",
                 f"OBI={features['obi_top5']}",
                 f"ATR%={features.get('atr_pct', 0)}%",
+                "LLM_UNAVAILABLE_QUANT_FALLBACK",
             ],
             reasoning_fa=(
-                f"ورود الگوریتمی ({trigger_reason}): شاخص RSI={features['rsi_14']}، عدم تعادل دفتر سفارشات "
-                f"OBI={features['obi_top5']}، نسبت خریداران Taker={features['taker_buy_ratio']} و نوسان ATR={features.get('atr_pct', 0)}٪. "
+                f"ورود الگوریتمی کمّی - مدل زبانی در دسترس نبود ({trigger_reason}): شاخص RSI={features['rsi_14']}، "
+                f"عدم تعادل دفتر سفارشات OBI={features['obi_top5']}، نسبت خریداران Taker={features['taker_buy_ratio']} "
+                f"و نوسان ATR={features.get('atr_pct', 0)}٪. "
                 f"حد ضرر در {sl_price:,.0f} تومان و حد سود در {tp_price:,.0f} تومان تنظیم شد."
             ),
+            decision_source="QUANT_FALLBACK",
         )

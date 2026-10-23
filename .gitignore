@@ -37,6 +37,7 @@ coverage.xml
 
 # Runtime logs and local trading state
 *.log
+*.json
 decision_logs*.jsonl
 portfolio_state.json
 

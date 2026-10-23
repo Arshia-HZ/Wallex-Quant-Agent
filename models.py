@@ -5,13 +5,29 @@ Data models and schemas for trading decisions, portfolio state, and order tracki
 
 from datetime import datetime, timezone
 from typing import List, Optional, Literal, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _clamp(value, lo: float, hi: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    if v != v:  # NaN
+        return lo
+    return min(max(v, lo), hi)
 
 
 class AIDecisionOutput(BaseModel):
     """
     Structured AI decision output schema.
     Directly satisfies the 35-point 'Real Use of AI' judging criterion.
+
+    decision_source makes the audit log honest about who produced the decision:
+      - "LLM"             : parsed from the language model's response
+      - "QUANT_FALLBACK"  : LLM unavailable/failed; deterministic rule produced the decision
+      - "QUANT_GATE"      : quant gatekeeper decided no LLM call was needed (HOLD)
+      - "RISK_ENGINE"     : deterministic stop-loss / take-profit / time-stop / liquidation
     """
     symbol: str
     action: Literal["BUY", "SELL", "HOLD"]
@@ -23,6 +39,19 @@ class AIDecisionOutput(BaseModel):
     take_profit_price: Optional[float] = None
     signals_observed: List[str] = Field(default_factory=list)
     reasoning_fa: str  # Persian technical reasoning logged for judges
+    decision_source: str = "LLM"
+    llm_latency_ms: Optional[float] = None
+
+    # An out-of-range number from the model must not discard an otherwise valid decision.
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _clamp_confidence(cls, v):
+        return _clamp(v, 0.0, 1.0)
+
+    @field_validator("allocation_pct", mode="before")
+    @classmethod
+    def _clamp_allocation(cls, v):
+        return _clamp(v, 0.0, 0.25)
 
 
 class PositionState(BaseModel):
