@@ -96,7 +96,7 @@ with st.sidebar:
     st.caption("StarCoach Agentic AI Hackathon")
 
     auto_refresh = st.toggle("Live Auto-Refresh (5s)", value=False)
-    if st.button("🔄 Refresh Telemetry Now", use_container_width=True):
+    if st.button("🔄 Refresh Telemetry Now", width='stretch'):
         st.rerun()
 
     st.divider()
@@ -215,7 +215,7 @@ with tab1:
                     "Take-Profit": f"{float(p.get('take_profit_price', 0)):,.0f}",
                     "Trailing Active": "✅ Yes" if p.get("trailing_active") else "⏳ Waiting",
                 })
-            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_rows), width='stretch', hide_index=True)
         else:
             st.success("100% Realized in Tomans (TMN) — Zero Open Crypto Exposure.")
 
@@ -230,7 +230,7 @@ with tab1:
                     "Allocated TMN": f"{float(po.get('order_tmn', 0)):,.0f}",
                     "Age (s)": f"{age_s}s / 180s",
                 })
-            st.dataframe(pd.DataFrame(pend_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pend_rows), width='stretch', hide_index=True)
         else:
             st.caption("No unfilled resting limit orders.")
 
@@ -288,7 +288,7 @@ with tab3:
     bt_symbol = b_col1.selectbox("Select Approved TMN Market", PRIORITY_ALLOWED_TMN_MARKETS, index=0)
     bt_hours = b_col2.slider("Historical Lookback (Hours)", 48, 336, 168, step=24)
 
-    if b_col3.button("▶️ Run Backtest", type="primary", use_container_width=True):
+    if b_col3.button("▶️ Run Backtest", type="primary", width='stretch'):
         with st.spinner(f"Fetching {bt_hours}h of 15m candles from Wallex and simulating trades on {bt_symbol}..."):
             bt_cfg = AgentConfig(mode=ExecutionMode.BACKTEST)
             tester = StrategyBacktester(bt_cfg, symbol=bt_symbol, lookback_hours=bt_hours)

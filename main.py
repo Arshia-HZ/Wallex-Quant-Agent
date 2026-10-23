@@ -364,13 +364,13 @@ class PortfolioAndRiskManager:
         try:
             with open(self.config.state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.shadow_available_tmn = float(data.get("shadow_available_tmn", self.config.initial_capital_tmn))
-            self.peak_equity_tmn = float(data.get("peak_equity_tmn", self.config.initial_capital_tmn))
-            self.realized_pnl_tmn = float(data.get("realized_pnl_tmn", 0.0))
+            self.shadow_available_tmn = float(data.get("shadow_available_tmn") or data.get("available_tmn") or self.config.initial_capital_tmn)
+            self.peak_equity_tmn = float(data.get("peak_equity_tmn") or self.config.initial_capital_tmn)
+            self.realized_pnl_tmn = float(data.get("realized_pnl_tmn") or 0.0)
             self.total_trades_count = int(data.get("total_trades_count", 0))
             self.winning_trades_count = int(data.get("winning_trades_count", 0))
             self.losing_trades_count = int(data.get("losing_trades_count", 0))
-            self.pending_buy_orders = data.get("pending_buy_orders", {})
+            self.pending_buy_orders = data.get("pending_buy_orders") or {}
 
             for sym, pos_dict in data.get("positions", {}).items():
                 pos_keys = OpenPosition.__annotations__.keys()
@@ -733,14 +733,36 @@ class TradingAgentRunner:
                     self._execute_sell(sym, pos, feats, det_exit, "DETERMINISTIC_RISK_EXIT", total_eq)
                     continue
 
-            # 3. Consult AI Strategist (if Quant Gatekeeper triggers)
+            # 3. Capacity & Spendable TMN Filter:
+            # If we already have MAX_CONCURRENT_POSITIONS open or insufficient cash,
+            # do NOT waste time, API tokens, and latency calling LLM for new BUY evaluations!
+            total_open_count = len(self.risk_mgr.positions) + len(self.risk_mgr.pending_buy_orders)
+            if pos is None:
+                if total_open_count >= self.config.max_concurrent_positions:
+                    continue
+                min_reserve = total_eq * self.config.min_cash_reserve_pct
+                spendable = max(0.0, avail_tmn - min_reserve)
+                if spendable < self.config.min_order_tmn:
+                    continue
+
+            # 4. Consult AI Strategist (if Quant Gatekeeper triggers)
             unrealized_pct = ((feats["best_bid"] - pos.entry_price) / pos.entry_price * 100.0) if pos else 0.0
+            time_held_sec = 0.0
+            if pos and pos.opened_at:
+                try:
+                    opened_dt = datetime.fromisoformat(pos.opened_at)
+                    time_held_sec = max(0.0, (datetime.now(timezone.utc) - opened_dt).total_seconds())
+                except Exception:
+                    time_held_sec = 0.0
+
             portfolio_context = {
                 "available_tmn": avail_tmn,
                 "total_equity_tmn": total_eq,
                 "position_qty": pos.quantity if pos else 0.0,
                 "entry_price": pos.entry_price if pos else None,
                 "unrealized_pnl_pct": round(unrealized_pct, 2),
+                "time_held_sec": time_held_sec,
+                "max_positions_reached": total_open_count >= self.config.max_concurrent_positions,
             }
             recent_flow = {"taker_buy_ratio": feats["taker_buy_ratio"], "obi_top5": feats["obi_top5"]}
 
@@ -757,7 +779,16 @@ class TradingAgentRunner:
                     self.risk_mgr.log_decision(sym, feats, decision, f"REJECTED: {reason}", None, total_eq)
 
             elif decision.action == "SELL" and pos is not None:
-                self._execute_sell(sym, pos, feats, decision, "AI_TACTICAL_EXIT", total_eq)
+                # Institutional Risk Guard for Tactical Exits:
+                # Never allow premature exit within 20 minutes if in minor loss (above SL).
+                # Fee drag (0.55%) is the #1 enemy. Let deterministic SL/TP manage the trade!
+                if time_held_sec < 1200 and unrealized_pct < 1.0:
+                    logger.info(
+                        f"[TACTICAL SELL BLOCKED] {sym} held for only {time_held_sec/60:.1f}m with PnL "
+                        f"{unrealized_pct:+.2f}%. Protecting trade from fee drag; leaving to SL/TP."
+                    )
+                else:
+                    self._execute_sell(sym, pos, feats, decision, "AI_TACTICAL_EXIT", total_eq)
 
             elif decision.action == "HOLD" and llm_invoked:
                 # Log genuine AI HOLD evaluations so judges see active AI filtering
@@ -776,16 +807,13 @@ class TradingAgentRunner:
         buy_fee_rate = self.config.taker_fee_rate if decision.order_type == "MARKET" else self.config.maker_fee_rate
         raw_qty = (order_tmn * (1.0 - buy_fee_rate)) / exec_price
 
-        atr_sl = exec_price - (1.5 * feats["atr_14"])
+        atr_sl = exec_price - (1.8 * feats["atr_14"])
         hard_sl = exec_price * (1.0 - self.config.hard_stop_loss_pct)
-        # max() ensures stop-loss never exceeds the -1.2% hard limit
         sl_price = max(atr_sl, hard_sl)
         if decision.stop_loss_price and hard_sl <= decision.stop_loss_price < exec_price:
             sl_price = decision.stop_loss_price
 
-        # Dynamic TP: max of fixed TP% or 3x SL distance (reward:risk >= 3:1)
-        sl_distance = exec_price - sl_price
-        atr_tp = exec_price + 3.0 * sl_distance
+        atr_tp = exec_price + (2.8 * feats["atr_14"])
         default_tp = exec_price * (1.0 + self.config.default_take_profit_pct)
         tp_price = max(atr_tp, default_tp)
         if decision.take_profit_price and decision.take_profit_price > exec_price * 1.008:
@@ -894,19 +922,20 @@ class TradingAgentRunner:
                 self.risk_mgr.save_state()
                 return
 
+            order_type = "LIMIT" if (decision.order_type == "LIMIT" and decision.limit_price and decision.limit_price >= exec_price) else "MARKET"
             res = self.client.place_spot_order(
                 symbol=sym,
                 side="SELL",
-                order_type="MARKET",
+                order_type=order_type,
                 quantity=sell_qty,
-                price=None,
+                price=decision.limit_price if order_type == "LIMIT" else None,
                 reference_price=exec_price,
             )
 
             gross_cost = pos.quantity * pos.entry_price
             gross_proceeds = sell_qty * exec_price
-            # Wallex Credit Account fees: Taker (0.30%) on MARKET sell, Maker (0.25%) on LIMIT buy
-            exit_fee = gross_proceeds * self.config.taker_fee_rate
+            exit_fee_rate = self.config.maker_fee_rate if order_type == "LIMIT" else self.config.taker_fee_rate
+            exit_fee = gross_proceeds * exit_fee_rate
             entry_fee = gross_cost * self.config.maker_fee_rate
             net_pnl_tmn = (gross_proceeds - exit_fee) - (gross_cost + entry_fee)
             net_pnl_pct = (net_pnl_tmn / max(gross_cost, 1.0)) * 100.0
@@ -914,7 +943,7 @@ class TradingAgentRunner:
             if self.config.mode == ExecutionMode.SHADOW:
                 self.risk_mgr.shadow_available_tmn += (gross_proceeds - exit_fee)
                 total_eq = self.risk_mgr.shadow_available_tmn + sum(
-                    p.quantity * feats["best_bid"] for s, p in self.risk_mgr.positions.items() if s != sym
+                    p.quantity * p.entry_price for s, p in self.risk_mgr.positions.items() if s != sym
                 )
 
             self.risk_mgr.realized_pnl_tmn += net_pnl_tmn

@@ -55,10 +55,10 @@ class AgentConfig:
 
     # Stop-Loss, Take-Profit & Trailing Stop Parameters
     hard_stop_loss_pct: float = field(
-        default_factory=lambda: float(os.getenv("HARD_STOP_LOSS_PCT", "0.012"))
+        default_factory=lambda: float(os.getenv("HARD_STOP_LOSS_PCT", "0.014"))
     )
     default_take_profit_pct: float = field(
-        default_factory=lambda: float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "0.024"))
+        default_factory=lambda: float(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "0.028"))
     )
     trailing_activation_pct: float = field(
         default_factory=lambda: float(os.getenv("TRAILING_STOP_ACTIVATION_PCT", "0.015"))
@@ -75,16 +75,16 @@ class AgentConfig:
         default_factory=lambda: os.getenv("CANDLE_RESOLUTION", "15")
     )
     min_atr_pct: float = field(
-        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.45"))
+        default_factory=lambda: float(os.getenv("MIN_ATR_PCT", "0.22"))
     )  # Blocks dead/flat markets that cannot beat 0.55%-0.60% round-trip fee
     max_spread_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.20"))
+        default_factory=lambda: float(os.getenv("MAX_SPREAD_PCT", "0.55"))
     )
     loop_interval_sec: int = field(
         default_factory=lambda: int(os.getenv("LOOP_INTERVAL_SECONDS", "40"))
     )
     stale_order_timeout_sec: int = field(
-        default_factory=lambda: int(os.getenv("STALE_ORDER_TIMEOUT_SECONDS", "180"))
+        default_factory=lambda: int(os.getenv("STALE_ORDER_TIMEOUT_SECONDS", "600"))
     )
     llm_hold_cooldown_sec: int = field(
         default_factory=lambda: int(os.getenv("LLM_HOLD_COOLDOWN_SECONDS", "240"))

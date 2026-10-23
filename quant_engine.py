@@ -149,12 +149,12 @@ class QuantFeatureEngine:
                 "min_rsi_last3": round(min_rsi_last3, 2),
                 "roc_3_pct": roc_3,
                 "rsi_14": round(rsi, 2),
-                "atr_14": round(atr, 2),
+                "atr_14": float(atr),
                 "atr_pct": atr_pct,
                 "bb_position": round(float(bb_pos), 3),
                 "volume_zscore": round(vol_z, 2),
-                "recent_low": round(recent_low, 2),
-                "recent_high": round(recent_high, 2),
+                "recent_low": float(recent_low),
+                "recent_high": float(recent_high),
             }
         except Exception as e:
             logger.error(f"Error computing quant features: {e}")

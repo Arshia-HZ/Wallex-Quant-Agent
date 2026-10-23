@@ -83,11 +83,7 @@ class StrategyBacktester:
                 elif position["tp"] and high_price >= position["tp"]:
                     exit_price = position["tp"]
                     exit_reason = "TAKE_PROFIT"
-                # Early Stagnation / Trend-Breakdown Exit: cuts dead trades before they hit full -1.20% SL
-                elif bars_held >= 6 and not features["trend_bullish"] and features["rsi_14"] < 45.0 and curr_price < position["entry_price"]:
-                    exit_price = curr_price
-                    exit_reason = "EARLY_TREND_BREAK_EXIT"
-                elif features["rsi_14"] > 74.0 and curr_price > position["entry_price"] * 1.012:
+                elif features["rsi_14"] > 74.0 and curr_price > position["entry_price"] * 1.015:
                     exit_price = curr_price
                     exit_reason = "OVERBOUGHT_PROFIT_TAKE"
 
@@ -118,10 +114,10 @@ class StrategyBacktester:
                     position["peak_price"] = high_price
 
                 gain = (position["peak_price"] - position["entry_price"]) / position["entry_price"]
-                if gain >= 0.017:
-                    # Lock at least +1.20% gross (+0.65% net after fees) once price has rallied +1.7%
-                    min_profit_lock = position["entry_price"] * 1.012
-                    trail_sl = position["peak_price"] * (1.0 - 0.006)
+                if gain >= self.config.trailing_activation_pct:
+                    # Lock at least +0.65% gross (covers 0.55% round-trip fee + net profit) once trailing triggers
+                    min_profit_lock = position["entry_price"] * 1.0065
+                    trail_sl = position["peak_price"] * (1.0 - self.config.trailing_distance_pct)
                     new_sl = max(position["sl"], min_profit_lock, trail_sl)
                     if new_sl > position["sl"]:
                         position["sl"] = new_sl
@@ -137,7 +133,7 @@ class StrategyBacktester:
                     continue
 
                 # Volatility must be large enough to clear Wallex's 0.55% round-trip fee
-                if features["atr_pct"] < 0.35:
+                if features["atr_pct"] < self.config.min_atr_pct:
                     continue
 
                 rsi = features["rsi_14"]
@@ -146,24 +142,30 @@ class StrategyBacktester:
                 rsi_turning_up = features["rsi_turning_up"]
 
                 is_buy = False
-                # Setup 1: Confirmed Macro Uptrend + Pullback that has ACTUALLY turned green/bounced
+                # Rule: In Spot trading, never buy into falling knives; require Macro Uptrend
+                if not features["macro_uptrend"]:
+                    continue
+
+                # Setup 1: Confirmed Macro Uptrend Pullback that has turned green
                 if (
                     features["macro_uptrend"]
                     and features["trend_bullish"]
                     and features["trend_strength_pct"] >= 0.08
-                    and (42.0 <= rsi <= 58.0)
+                    and (40.0 <= rsi <= 58.0)
                     and bullish_rebound
                     and rsi_turning_up
+                    and vol_z >= -0.3
                 ):
                     is_buy = True
 
-                # Setup 2: Oversold Spring Reversal (Previous bars dipped <30 RSI, current bar is a strong green rebound)
+                # Setup 2: Oversold Spring Reversal within Macro Uptrend
                 elif (
-                    features["min_rsi_last3"] < 30.0
-                    and rsi >= 31.0
+                    features["macro_uptrend"]
+                    and features["min_rsi_last3"] < 33.0
+                    and rsi >= 32.0
                     and bullish_rebound
                     and rsi_turning_up
-                    and vol_z > 0.3
+                    and vol_z > 0.0
                 ):
                     is_buy = True
 
@@ -171,10 +173,10 @@ class StrategyBacktester:
                 elif (
                     features["macro_uptrend"]
                     and features["trend_bullish"]
-                    and vol_z >= 1.8
-                    and features["roc_3_pct"] >= 0.45
+                    and vol_z >= 1.5
+                    and features["roc_3_pct"] >= 0.40
                     and bullish_rebound
-                    and (52.0 <= rsi <= 65.0)
+                    and (50.0 <= rsi <= 65.0)
                 ):
                     is_buy = True
 
@@ -190,7 +192,7 @@ class StrategyBacktester:
 
                     entry_fee = target_tmn * self.maker_fee
                     tp = max(
-                        entry_price + (3.2 * features["atr_14"]),
+                        entry_price + (2.8 * features["atr_14"]),
                         entry_price * (1.0 + self.config.default_take_profit_pct),
                     )
 
